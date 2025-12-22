@@ -429,24 +429,14 @@ def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, nu
     return x0, transfer_index
 
 def get_transfer_index_g(logits, temperature, remasking, mask_index, x, num_transfer_tokens, block_length, avg_attn_scores, conf_arch, e_threshold=0.1, c_d=0.9, c_c=0.7):
-    # remove self-loops
-    # it seems that eq_min is the most important parameter to control the speed. smaller eq_min means slower at the beginning but faster at the end.
-    # it seems that cq_max is the less important parameter to control the speed. larger cq_max means slower at the beginning but faster at the end.
-    # unmask_ratio = 1 - float(mask_index.sum(dim=-1).min().item()) / float(block_length) # local unmask ratio or global unmask ratio?
     # attn sink removal
     assert avg_attn_scores is not None, 'avg_attn_scores is None'
     sink_mask = detect_attn_sinks(avg_attn_scores, topk=3)
-    # print(f'sink_mask shape: {sink_mask.shape}, num of sink: {sink_mask.sum(dim=-1).sum().item()}')
     key_sink_mask = sink_mask.unsqueeze(1)      # [B, 1, L]
     avg_attn_scores = avg_attn_scores.masked_fill(key_sink_mask, 0.0)  # [B, L, L]
-    # avg_scores = avg_scores.softmax(dim=-1)
-    # mean field inference
-    # logits = mean_field(logits, avg_scores, beta=0.5, T=2)
 
-    B, N, _ = avg_attn_scores.shape
-    mask = ~torch.eye(N, dtype=torch.bool, device=avg_attn_scores.device).unsqueeze(0)   # [1, N, N]
-    mask = mask.expand(B, -1, -1)  # [B, N, N]
-    avg_attn_scores = avg_attn_scores * mask.float() # directed graph
+    B, _, _ = avg_attn_scores.shape
+    avg_attn_scores.diagonal(dim1=1, dim2=2).zero_()
 
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
@@ -460,14 +450,7 @@ def get_transfer_index_g(logits, temperature, remasking, mask_index, x, num_tran
     else:
         raise NotImplementedError(remasking)
 
-    # e_qt = 1 - N / N ** 2
-    # print(f'e_qt: {e_qt}')
-    
-    flat_avg_score = avg_attn_scores.view(avg_attn_scores.shape[0], -1)
-    # e_threshold = torch.quantile(flat_avg_score, e_qt, dim=-1)
-    quantile_mask = flat_avg_score >= 0.1 # according to the block dlm attn map
-    # print(f'quantile_mask shape: {quantile_mask.shape}, quantile_mask.sum(dim=-1): {quantile_mask.sum(dim=-1)}')
-    quantile_mask = quantile_mask.reshape(B, N, N).to(torch.bool)
+    quantile_mask = avg_attn_scores >= e_threshold
     quantile_mask = quantile_mask.transpose(1, 2)
 
     # select the dependent nodes
@@ -482,7 +465,6 @@ def get_transfer_index_g(logits, temperature, remasking, mask_index, x, num_tran
     dependent_conf, _ = dependent_conf.max(dim=1)
     conf_d = torch.where(dependent_nodes, x0_p, -np.inf)
     transfer_index = conf_d >= (c_d + c_c - dependent_conf)
-    # print(f'transfer_index shape: {transfer_index.shape}, transfer_index.sum(dim=-1): {transfer_index.sum(dim=-1)}')
 
     # select the conflicting nodes
     # node_mask = mask_index & ~sink_mask & (x0_p >= 0.7) 
@@ -494,41 +476,23 @@ def get_transfer_index_g(logits, temperature, remasking, mask_index, x, num_tran
         _node_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1) # [B, N, N]
         edge_mask = _node_mask & quantile_mask # [B, N, N]
 
-        # x0 = torch.where(node_mask, x0, x)
         confidence = torch.where(node_mask, x0_p, -np.inf)
 
-        # graph_data_batch = build_graph_batch(avg_attn_scores, edge_mask, node_mask, confidence=confidence)
-        ti_c = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+        transfer_index_c = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
         for j in range(B):
-            # select_index = select_parallel_tokens_conflict_mis(graph_data_batch[j], max_parallel= block_length) # the best parameter should be considered
             select_index = select_parallel_tokens_conflict_mis(edge_mask[j], node_mask[j], confidence[j])
-            ti_c[j, select_index] = True
+            transfer_index_c[j, select_index] = True
 
-        transfer_index = transfer_index | ti_c
-        # print(f'ti_c shape: {ti_c.shape}, ti_c.sum(dim=-1): {ti_c.sum(dim=-1)}')
-    # print(f'transfer_index shape: {transfer_index.shape}, transfer_index.sum(dim=-1): {transfer_index.sum(dim=-1)}')
+        transfer_index = transfer_index | transfer_index_c
     
     if transfer_index.sum(dim=-1).min().item() == 0:
-        # print(f'transfer_index.sum(dim=-1).min().item() == 0')
-        x0 = torch.where(mask_index, x0, x)
+        # x0 = torch.where(mask_index, x0, x)
         confidence = torch.where(mask_index, x0_p, -np.inf)
         
-        _, idx = torch.sort(confidence, dim=-1, descending=True)
-        B, L = confidence.shape
-        # Build a mask that is True for the first k[b] columns in each row (sorted order)
-        cols = torch.arange(L, device=confidence.device).unsqueeze(0).expand(B, L)   # (B, L)
-        k_expanded = torch.full((B, L), 1, device=confidence.device, dtype=torch.long)  # (B, L)
-        select_sorted = cols < k_expanded                                            # (B, L) bool
-
-        # Scatter the sorted True/False back to original column order
-        # Use integer scatter then cast to bool (scatter_ on bool can be finicky across versions)
-        transfer_int = torch.zeros(B, L, device=confidence.device, dtype=torch.int8) # (B, L)
-        transfer_int = transfer_int.scatter(1, idx, select_sorted.to(torch.int8))
-        # transfer_index = transfer_int.bool() & mask_index  # ensure we never select unmasked
-        transfer_index = transfer_int.bool()
+        max_conf_indices = torch.argmax(confidence, dim=1, keepdim=True) # (B, 1)
+        force_mask = torch.zeros_like(transfer_index).scatter_(1, max_conf_indices, True)
+        transfer_index = transfer_index | force_mask
         
-    # assert node_mask.sum(dim=-1).min().item() > 0, f'node_mask.sum(dim=-1).min().item(): {node_mask.sum(dim=-1).min().item()}, mask_index.sum(dim=-1).min().item(): {mask_index.sum(dim=-1).min().item()}, (x0_p >= c_threshold).sum(dim=-1).min().item(): {(x0_p >= c_threshold).sum(dim=-1).min().item()}'
-    # node_mask = mask_index
     return x0, transfer_index, x0_p
 
 def main():
