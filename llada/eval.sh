@@ -27,8 +27,8 @@ factor=1
 # g-dllm
 CUDA_VISIBLE_DEVICES=0 accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
 --confirm_run_unsafe_code --model llada_dist \
---model_args model_path=${model_path},gen_length=${length},steps=${length},block_length=${block_length},show_speed=True,g_dllm=True,threshold_c=0.7,outp_path=evals_results/g-dllm_test/gsm8k-ns0-${length}/results.jsonl \
---output_path evals_results/g-dllm_test/gsm8k-ns0-${length}
+--model_args model_path=${model_path},gen_length=${length},steps=${length},block_length=${block_length},show_speed=True,g_dllm=True,threshold_c=0.7,outp_path=evals_results/g-dllm/gsm8k-ns0-${length}/results.jsonl \
+--output_path evals_results/g-dllm/gsm8k-ns0-${length}
 
 # factor
 # CUDA_VISIBLE_DEVICES=0 accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
@@ -71,8 +71,8 @@ model_path='/workplace/models/LLaDA-8B-Instruct'
 # g-dllm
 # CUDA_VISIBLE_DEVICES=0 accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
 # --confirm_run_unsafe_code --model llada_dist \
-# --model_args model_path=${model_path},gen_length=${length},steps=${length},block_length=${block_length},show_speed=True,g_dllm=True,threshold_c=0.7,outp_path=evals_results/g-dllm_test/math-ns0-${length}/results.jsonl \
-# --output_path evals_results/g-dllm_test/math-ns0-${length}
+# --model_args model_path=${model_path},gen_length=${length},steps=${length},block_length=${block_length},show_speed=True,g_dllm=True,threshold_c=0.7,outp_path=evals_results/g-dllm/math-ns0-${length}/results.jsonl \
+# --output_path evals_results/g-dllm/math-ns0-${length}
 
 # factor
 # CUDA_VISIBLE_DEVICES=0 accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \

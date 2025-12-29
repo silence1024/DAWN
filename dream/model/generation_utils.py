@@ -363,7 +363,7 @@ class DreamGenerationMixin:
         threshold_c = kwargs.get("threshold_c", 0.7)
         block_length = kwargs.get("block_length", 32)
 
-        result = self._sample_block(
+        result, nfe = self._sample_block(
             input_ids,
             attention_mask=attention_mask,
             generation_config=generation_config,
@@ -375,7 +375,7 @@ class DreamGenerationMixin:
             threshold_c=threshold_c,
             block_length=block_length,
         )
-        return result
+        return result, nfe
 
     def _sample(
         self,
@@ -798,6 +798,6 @@ class DreamGenerationMixin:
             return DreamModelOutput(
                 sequences=x,
                 history=histories,
-            )
+            ), nfe
         else:
-            return x
+            return x, nfe
