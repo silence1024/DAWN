@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
+import numpy as np
 import torch.distributions as dists
 from torch.nn import functional as F
 from transformers import __version__
@@ -34,6 +35,8 @@ from transformers.utils import (
     is_torchdynamo_compiling,
     logging,
 )
+
+from model.gdllm_utils import detect_attn_sinks, select_parallel_tokens_conflict_mis
 
 logger = logging.get_logger(__name__)
 
@@ -373,7 +376,10 @@ class DreamGenerationMixin:
         generation_config: DreamGenerationConfig,
         generation_tokens_hook_func,
         generation_logits_hook_func,
-        threshold: Optional[float] = 0.9
+        threshold: Optional[float] = 0.9,
+        threshold_e: Optional[float] = 0.1,
+        threshold_d: Optional[float] = 0.9,
+        threshold_c: Optional[float] = 0.7,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         output_history = generation_config.output_history
@@ -420,9 +426,16 @@ class DreamGenerationMixin:
 
             number_transfer_tokens = mask_index.sum().item() // steps
             left_tokens_last_step = 0
+        if alg == 'g-dllm':
+            conf_arch = torch.full_like(x, 0.0, device=self.device, dtype=torch.bfloat16)
+            conf_arch[:, :input_ids.shape[1]] = 1.0
         while i < steps:
             mask_index = (x == mask_token_id)
-            logits = self(x, attention_mask, tok_idx).logits
+            if mask_index.sum() == 0:
+                steps = i
+                break
+            output, avg_attn_scores = self(x, attention_mask, tok_idx, return_attn_scores= (alg == 'g-dllm'))
+            logits = output.logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
 
             # this allows user-defined logits control of the intermediate steps
@@ -463,7 +476,60 @@ class DreamGenerationMixin:
                             transfer_index[0, select_index[0, k]] = False
 
                 x[transfer_index] = x_[transfer_index].clone()
+            elif alg == 'g-dllm':
+                assert avg_attn_scores is not None, 'avg_attn_scores is None'
+                sink_mask = detect_attn_sinks(avg_attn_scores, topk=3)
+                key_sink_mask = sink_mask.unsqueeze(1)      # [B, 1, L]
+                avg_attn_scores = avg_attn_scores.masked_fill(key_sink_mask, 0.0)  # [B, L, L]
 
+                B, _, _ = avg_attn_scores.shape
+                avg_attn_scores.diagonal(dim1=1, dim2=2).zero_()
+                
+                x0_p, x0 = sample_tokens(logits, temperature=temperature, top_p=top_p, top_k=top_k)
+
+                quantile_mask = avg_attn_scores >= threshold_e
+                quantile_mask = quantile_mask.transpose(1, 2)
+
+                # select the dependent nodes
+                decoded_mask = (~mask_index & (conf_arch >= threshold_d)).unsqueeze(-1)
+                decoded_edge = quantile_mask & decoded_mask # [B, ?, N]
+                dependent_nodes = decoded_edge.any(dim=1) & mask_index
+                dependent_conf = torch.where(
+                                        decoded_edge, # [B, ?, N]                  
+                                        conf_arch.unsqueeze(-1), # [B, ?, 1]        
+                                        torch.zeros_like(conf_arch.unsqueeze(-1))  
+                                    )
+                dependent_conf, _ = dependent_conf.max(dim=1)
+                conf_d = torch.where(dependent_nodes, x0_p, -np.inf)
+                transfer_index = conf_d >= (threshold_d + threshold_c - dependent_conf)
+
+                adj_ti_mask = quantile_mask & transfer_index.unsqueeze(-1)
+                adj_ti_mask = adj_ti_mask.any(dim=1)
+                node_mask = mask_index & (x0_p >= threshold_c) & ~transfer_index & ~adj_ti_mask
+
+                if node_mask.sum(dim=-1).min().item() != 0:
+                    _node_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1) # [B, N, N]
+                    edge_mask = _node_mask & quantile_mask # [B, N, N]
+
+                    confidence = torch.where(node_mask, x0_p, -np.inf)
+
+                    transfer_index_c = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+                    for j in range(B):
+                        select_index = select_parallel_tokens_conflict_mis(edge_mask[j], node_mask[j], confidence[j])
+                        transfer_index_c[j, select_index] = True
+
+                    transfer_index = transfer_index | transfer_index_c
+                
+                if transfer_index.sum(dim=-1).min().item() == 0:
+                    # x0 = torch.where(mask_index, x0, x)
+                    confidence = torch.where(mask_index, x0_p, -np.inf)
+                    
+                    max_conf_indices = torch.argmax(confidence, dim=1, keepdim=True) # (B, 1)
+                    force_mask = torch.zeros_like(transfer_index).scatter_(1, max_conf_indices, True)
+                    transfer_index = transfer_index | force_mask
+
+                x[transfer_index] = x0[transfer_index]
+                conf_arch[transfer_index] = x0_p[transfer_index]
             else:
                 if alg == 'maskgit_plus':
                     confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)

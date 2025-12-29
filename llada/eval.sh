@@ -9,7 +9,7 @@ length=256
 block_length=32
 num_fewshot=5
 steps=$((length / block_length))
-model_path='/workplace/models/LLaDA-8B-Instruct'
+model_path='/workplace/models/LLaDA/LLaDA-8B-Instruct'
 factor=1
 
 # baseline

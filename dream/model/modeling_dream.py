@@ -54,6 +54,15 @@ logger = logging.get_logger(__name__)
 _CHECKPOINT_FOR_DOC = "Dream-7B"
 _CONFIG_FOR_DOC = "DreamConfig"
 
+@torch.compile()
+def attn_avg(q, k, attn_mask=None):
+    d = q.size(-1)
+    s = (q @ k.transpose(-2, -1)) / math.sqrt(d)
+    if attn_mask is not None:
+        s = s + attn_mask
+    p = torch.softmax(s, dim=-1)
+    return p.mean(dim=1)
+
 class BaseModelOutputWithPast(BaseModelOutput):
     def __init__(self, last_hidden_state: torch.FloatTensor, hidden_states: Optional[Tuple[torch.FloatTensor]] = None, attentions: Optional[Tuple[torch.FloatTensor]] = None, past_key_values: Optional[Tuple[torch.FloatTensor]] = None):
         super().__init__(last_hidden_state, hidden_states, attentions)
@@ -377,6 +386,7 @@ class DreamSdpaAttention(DreamAttention):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
         replace_position: Optional[torch.Tensor] = None,
         dual_cache: Optional[bool] = False,
+        return_attn_scores: Optional[bool] = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
@@ -452,6 +462,9 @@ class DreamSdpaAttention(DreamAttention):
         # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
         # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
         # is_causal = True if causal_mask is None and q_len > 1 else False
+        avg_attn_scores = None
+        if return_attn_scores:
+            avg_attn_scores = attn_avg(query_states, key_states, attention_mask if isinstance(attention_mask, torch.Tensor) else None).clone()
 
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
@@ -467,7 +480,7 @@ class DreamSdpaAttention(DreamAttention):
 
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, None, past_key_value
+        return attn_output, avg_attn_scores, past_key_value
 
 
 class DreamDecoderLayer(nn.Module):
@@ -500,8 +513,9 @@ class DreamDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
         dual_cache: Optional[bool] = False,
         replace_position: Optional[torch.Tensor] = None,
+        return_attn_scores: Optional[bool] = False,
         **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> Tuple[torch.FloatTensor, Optional[torch.FloatTensor], Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -529,7 +543,7 @@ class DreamDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, avg_attn_scores, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -540,6 +554,7 @@ class DreamDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             dual_cache=dual_cache,
             replace_position=replace_position,
+            return_attn_scores=return_attn_scores,
         )
         hidden_states = residual + hidden_states
 
@@ -552,12 +567,12 @@ class DreamDecoderLayer(nn.Module):
         outputs = (hidden_states,)
 
         if output_attentions:
-            outputs += (self_attn_weights,)
+            outputs += (avg_attn_scores,)
 
         if use_cache:
             outputs += (present_key_value,)
 
-        return outputs
+        return outputs, avg_attn_scores
 
 class DreamPreTrainedModel(PreTrainedModel):
     config_class = DreamConfig
@@ -680,6 +695,7 @@ class DreamBaseModel(DreamPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         dual_cache: Optional[bool] = False,
         replace_position: Optional[torch.Tensor] = None,
+        return_attn_scores: Optional[bool] = False,
     ) -> Union[Tuple, BaseModelOutput]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -731,6 +747,8 @@ class DreamBaseModel(DreamPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
+        all_avg_scores = []
+
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -752,7 +770,7 @@ class DreamBaseModel(DreamPreTrainedModel):
                     replace_position,
                 )
             else:
-                layer_outputs = decoder_layer(
+                layer_outputs, avg_attn_scores = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -763,6 +781,7 @@ class DreamBaseModel(DreamPreTrainedModel):
                     position_embeddings=position_embeddings,
                     dual_cache=dual_cache,
                     replace_position=replace_position,
+                    return_attn_scores=return_attn_scores and layer_idx >= 24,
                 )
 
             hidden_states = layer_outputs[0]
@@ -771,6 +790,9 @@ class DreamBaseModel(DreamPreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
             if use_cache:
                 attn_key_values.append(layer_outputs[1])
+                
+            if return_attn_scores and layer_idx >= 24:
+                all_avg_scores.append(avg_attn_scores)
 
         hidden_states = self.norm(hidden_states)
 
@@ -778,14 +800,17 @@ class DreamBaseModel(DreamPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
+        if return_attn_scores:
+            avg_attn_scores = torch.stack(all_avg_scores).mean(dim=0)
+
         if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(v for v in [hidden_states, all_hidden_states, all_self_attns] if v is not None), avg_attn_scores
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             past_key_values=attn_key_values,
-        )
+        ), avg_attn_scores
 
 
 class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
@@ -839,6 +864,7 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
         num_logits_to_keep: int = 0,
         dual_cache: Optional[bool] = False,
         replace_position: Optional[torch.Tensor] = None,
+        return_attn_scores: Optional[bool] = False,
         **loss_kwargs,
     ) -> Union[Tuple, MaskedLMOutput]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -848,7 +874,7 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
+        outputs, avg_attn_scores = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -861,6 +887,7 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
             cache_position=cache_position,
             dual_cache=dual_cache,
             replace_position=replace_position,
+            return_attn_scores=return_attn_scores,
         )
         hidden_states = outputs[0]
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
@@ -872,7 +899,7 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
 
         if not return_dict:
             output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
+            return (loss,) + output if loss is not None else output, avg_attn_scores
 
         return MaskedLMOutputWithPastKeyValues(
             loss=loss,
@@ -880,4 +907,4 @@ class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
-        )
+        ), avg_attn_scores
