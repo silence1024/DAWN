@@ -635,7 +635,7 @@ class DreamGenerationMixin:
             tok_idx = None
             attention_mask = "full"
 
-        timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
+        timesteps = torch.linspace(1, eps, steps_per_block + 1, device=x.device)
 
         # this allows user-defined token control of the intermediate steps
         x = generation_tokens_hook_func(None, x, None)
@@ -657,7 +657,7 @@ class DreamGenerationMixin:
                 number_transfer_tokens = block_mask_index.sum().item() // steps_per_block
                 left_tokens_last_step = 0
             i = 0
-            while i < steps_per_block:
+            while True:
                 mask_index = (x == mask_token_id)
                 mask_index[:, input_ids.shape[1] + (num_block + 1) * block_length:] = 0
                 if mask_index.sum() == 0:
@@ -676,7 +676,7 @@ class DreamGenerationMixin:
                     s = timesteps[i + 1]
             
                 if alg == 'origin':
-                    p_transfer = 1 - s / t if i < steps - 1 else 1
+                    p_transfer = 1 - s / t if i < steps_per_block - 1 else 1
                     x0 = torch.zeros_like(x[mask_index], device=self.device, dtype=torch.long) + mask_token_id
                     transfer_index_t_s = torch.rand(*x0.shape, device=self.device) < p_transfer
                     _, x0[transfer_index_t_s]= sample_tokens(mask_logits[transfer_index_t_s], temperature=temperature, top_p=top_p, top_k=top_k)
@@ -695,12 +695,12 @@ class DreamGenerationMixin:
                     transfer_index[0, select_index[0]] = True
                     for k in range(1, current_transfer_tokens):
                         if selected_confidence[0, k] < threshold:
-                            if i < steps - 1:
+                            if i < steps_per_block - 1:
                                 left_tokens_last_step += 1
                                 transfer_index[0, select_index[0, k]] = False
                             else:
                                 number_transfer_tokens = 0
-                                steps += 1
+                                steps_per_block += 1
                                 left_tokens_last_step += 1
                                 transfer_index[0, select_index[0, k]] = False
 
@@ -769,7 +769,7 @@ class DreamGenerationMixin:
                     else:
                         raise RuntimeError(f"Unknown alg: {alg}")
                     num_mask_token = mask_index.sum() / mask_index.shape[0]
-                    number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else int(num_mask_token)
+                    number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps_per_block - 1 else int(num_mask_token)
                     full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
                     full_confidence[mask_index] = confidence
                     if number_transfer_tokens > 0:
