@@ -124,7 +124,7 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
             if factor is not None:
                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, None, factor)
             elif g_dllm:
-                x0, transfer_index, conf = get_transfer_index_g(logits, temperature, remasking, mask_index, x, None, avg_attn_scores, conf_arch, threshold_c=threshold_c)
+                x0, transfer_index, conf = get_transfer_index_g(logits, temperature, remasking, mask_index, x, None, avg_attn_scores, conf_arch, threshold_c=threshold_c, num_block = num_block, block_length = block_length, prompt_length = prompt.shape[1])
                 conf_arch[transfer_index] = conf[transfer_index]
             elif local_leap:
                 x0, transfer_index = get_transfer_index_localleap(logits, temperature, remasking, mask_index, x, None)
@@ -430,7 +430,7 @@ def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, nu
 
     return x0, transfer_index
 
-def get_transfer_index_g(logits, temperature, remasking, mask_index, x, num_transfer_tokens, avg_attn_scores, conf_arch, threshold_e=0.1, threshold_d=0.9, threshold_c=0.7):
+def get_transfer_index_g(logits, temperature, remasking, mask_index, x, num_transfer_tokens, avg_attn_scores, conf_arch, threshold_e=0.1, threshold_d=0.9, threshold_c=0.7, num_block=0, block_length=32, prompt_length=None):
     # attn sink removal
     assert avg_attn_scores is not None, 'avg_attn_scores is None'
     # sink_mask = detect_attn_sinks(avg_attn_scores, topk=3)
@@ -453,40 +453,46 @@ def get_transfer_index_g(logits, temperature, remasking, mask_index, x, num_tran
     else:
         raise NotImplementedError(remasking)
 
-    quantile_mask = avg_attn_scores >= threshold_e
+    quantile_mask = avg_attn_scores >= 0.07
     quantile_mask = quantile_mask.transpose(1, 2)
 
+    # confidence aware 
+    confidence = torch.where(mask_index, x0_p, -np.inf)
+    transfer_index_conf = confidence >= 0.9
+
     # select the dependent nodes
-    decoded_mask = (~mask_index & (conf_arch >= threshold_d)).unsqueeze(-1)
+    decoded_mask = (~mask_index & (x0_p >= 0.9)).unsqueeze(-1)
+    # decoded_mask = (~mask_index & (conf_arch >= 0.9)).unsqueeze(-1)
+    decoded_mask[:, prompt_length + (num_block + 1) * block_length:] = False
     decoded_edge = quantile_mask & decoded_mask # [B, ?, N]
     dependent_nodes = decoded_edge.any(dim=1) & mask_index
-    dependent_conf = torch.where(
-                            decoded_edge, # [B, ?, N]                  
-                            conf_arch.unsqueeze(-1), # [B, ?, 1]        
-                            torch.zeros_like(conf_arch.unsqueeze(-1))  
-                        )
-    dependent_conf, _ = dependent_conf.max(dim=1)
+    # dependent_conf = torch.where(
+    #                         decoded_edge, # [B, ?, N]                  
+    #                         conf_arch.unsqueeze(-1), # [B, ?, 1]        
+    #                         torch.zeros_like(conf_arch.unsqueeze(-1))  
+    #                     )
+    # dependent_conf, _ = dependent_conf.max(dim=1)
     conf_d = torch.where(dependent_nodes, x0_p, -np.inf)
-    transfer_index = conf_d >= (threshold_d + threshold_c - dependent_conf)
+    # transfer_index = conf_d >= (threshold_d + threshold_c - dependent_conf)
+    transfer_index_a = conf_d >= 0.7
 
     # select the conflicting nodes
     # node_mask = mask_index & ~sink_mask & (x0_p >= 0.7) 
-    adj_ti_mask = quantile_mask & transfer_index.unsqueeze(-1)
+    adj_ti_mask = quantile_mask & transfer_index_a.unsqueeze(-1) & transfer_index_conf.unsqueeze(-1)
     adj_ti_mask = adj_ti_mask.any(dim=1)
-    node_mask = mask_index & (x0_p >= threshold_c) & ~transfer_index & ~adj_ti_mask
+    node_mask = mask_index & (x0_p >= threshold_c) & (x0_p < 0.9) & ~transfer_index_a & ~adj_ti_mask
+    transfer_index_c = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
 
     if node_mask.sum(dim=-1).min().item() != 0:
         _node_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1) # [B, N, N]
         edge_mask = _node_mask & quantile_mask # [B, N, N]
 
         confidence = torch.where(node_mask, x0_p, -np.inf)
-
-        transfer_index_c = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
         for j in range(B):
             select_index = select_parallel_tokens_conflict_mis(edge_mask[j], node_mask[j], confidence[j])
             transfer_index_c[j, select_index] = True
 
-        transfer_index = transfer_index | transfer_index_c
+    transfer_index = transfer_index_a | transfer_index_conf | transfer_index_c
     
     if transfer_index.sum(dim=-1).min().item() == 0:
         # x0 = torch.where(mask_index, x0, x)

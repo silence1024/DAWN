@@ -36,7 +36,7 @@ from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from lm_eval.models.utils import get_dtype
 from lm_eval.__main__ import cli_evaluate
-from model.generation_utils_block import DreamGenerationMixin
+from model.generation_utils import DreamGenerationMixin
 import types
 from model.configuration_dream import DreamConfig
 from model.modeling_dream import DreamModel
@@ -76,7 +76,8 @@ class Dream(LM):
         threshold: Optional[float] = 0.9,
         threshold_e: Optional[float] = 0.1,
         threshold_d: Optional[float] = 0.9,
-        threshold_c: Optional[float] = 0.7,
+        conf_threshold: Optional[float] = 0.7,
+        kl_threshold: Optional[float] = 0.015,
         block_length: Optional[int] = 32,
         apply_chat_template: Optional[bool] = False,
         use_cache: Optional[bool] = False,
@@ -208,7 +209,8 @@ class Dream(LM):
         self.threshold = threshold
         self.threshold_e = threshold_e
         self.threshold_d = threshold_d
-        self.threshold_c = threshold_c
+        self.conf_threshold = conf_threshold
+        self.kl_threshold = kl_threshold
         self.block_length = block_length
         # loglikelihood params
         self.nll_type = nll_type
@@ -332,7 +334,8 @@ class Dream(LM):
             threshold=self.threshold,
             threshold_e=self.threshold_e,
             threshold_d=self.threshold_d,
-            threshold_c=self.threshold_c,
+            conf_threshold=self.conf_threshold,
+            kl_threshold=self.kl_threshold,
             dual_cache=self.dual_cache,
             block_length=self.block_length,
         )
