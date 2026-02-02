@@ -17,17 +17,14 @@ We propose DAWN, a training-free, dependency-aware decoding method for fast dLLM
 - Python 3.10.12
 - NVIDIA GPU + CUDA 12.1 compatible driver
 
-## Install
-
-1) Install PyTorch (CUDA 12.1 wheels):
-```bash
-pip install --index-url https://download.pytorch.org/whl/cu121 \
-  torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121
-```
-
-2) Install the rest:
+## Installation
+### Option A: Standard install (recommended)
 ```bash
 pip install -r requirements.txt
+```
+### Option B: Reproducible install
+```bash
+pip install -r requirements-lock.txt
 ```
 
 ## Eval
