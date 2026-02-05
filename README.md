@@ -11,11 +11,15 @@ DAWN is a **training-free**, **dependency-aware** decoding method for fast dLLM 
 DAWN leverages a dependency graph to select more reliable unmasking positions at each iteration, achieving high parallelism with negligible loss in generation quality. 
 
 ## 🚀 Features
+- Mitigate nonindependent prediction via inter-poistion dependency.
+- A training-free, plug-and-play method, improving quality-speed trade-off.
 - Fast inference support for Dream and LLaDA model.
 - Multiple baseline method realization. 
 - Full evaluation provided.
-### Key Features
+## 🔍 Key Details
+
 ![overview](asset/overview.png)
+
 **DAWN** is composed of three main modules: *Dependency Graph Construction*, *Anchor-Guided Decoding* and *Conflict-Based Scheduling*.
 
 1. *Dependency Graph Construction* extracts a lightweight proxy of token dependencies from the model’s attention maps and builds a sparse directed dependency graph. It mitigates attention-sink bias by filtering positions with abnormal incoming attention mass, then retains only salient high-score attention links to capture meaningful couplings between positions for downstream scheduling.
@@ -31,8 +35,6 @@ pip install -r requirements.txt
 ```
 
 ### Option B: Reproducible install
-- Python 3.10.12
-- NVIDIA GPU + CUDA 12.1 compatible driver
 ```bash
 pip install -r requirements-lock.txt
 ```
@@ -45,6 +47,7 @@ cd llada
 bash eval_instruct.sh
 ```
 The main experiment is conducted on an Nvidia H100 80 GPU, DAWN exhibits efficiency across multiple models and benchmarks:
+
 ![main result](asset/main_result.png)
 
 ## 🎓 Citation
