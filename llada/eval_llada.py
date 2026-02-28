@@ -31,6 +31,7 @@ from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
+from lm_eval.utils import simple_parse_args_string
 from tqdm import tqdm
 import os
 from transformers import AutoTokenizer, AutoModel, AutoConfig
@@ -49,6 +50,14 @@ def set_seed(seed):
 
 @register_model("llada_dist")
 class LLaDAEvalHarness(LM):
+    @classmethod
+    def create_from_arg_string(cls, arg_string, additional_config=None):
+        args = simple_parse_args_string(arg_string)
+        config = {} if additional_config is None else dict(additional_config)
+        # Prefer explicit model_args values when the same key is also passed by lm-eval defaults.
+        config.update(args)
+        return cls(**config)
+
     def __init__(
         self,
         model_path='',
