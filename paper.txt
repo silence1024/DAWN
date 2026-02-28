@@ -1,0 +1,708 @@
+                           DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+                     LizhuoLuo12 ZhuoranShi3 JiajunLuo4 ZhiWang4 ShenRen5 WenyaWang1 TianweiZhang1
+                                       Abstract                               have recently been extended to text generation. Unlike au-
+                    Diffusion large language models (dLLMs) have              toregressive (AR) models (OpenAI et al., 2024; Qwen et al.,
+                    shownadvantages in text generation, particularly          2025) that generate tokens sequentially, diffusion large lan-
+                    due to their inherent ability for parallel decod-         guage models (dLLMs) (Nie et al., 2025; Ye et al., 2025)
+                    ing. However, constrained by the quality–speed            adopt full attention over all positions and refine an entire
+                    trade-off, existing inference solutions adopt con-        sequence through multiple denoising iterations, achieving
+                    servative parallel strategies, leaving substantial        surprisingly strong performance on text generation tasks.
+                    efficiency potential underexplored. A core chal-          dLLMsofferpotential solutions to longstanding limitations
+                    lenge is that parallel decoding assumes each po-          of AR models, including the inability to decode in parallel
+                    sition can be filled independently, but tokens are        and the reversal curse (Berglund et al., 2023). These char-
+                    often semantically coupled. Thus, the correct             acteristics have drawn growing research interest in further
+                    choice at one position constrains valid choices           advancing dLLMs (Google DeepMind, 2025; Song et al.,
+                    at others. Without modeling these inter-token             2025b; Labs et al., 2025; Bie et al., 2025).
+                    dependencies, parallel strategies produce deterio-        Despite these efforts, dLLMs still exhibit performance gaps
+                    rated outputs. Motivated by this insight, we pro-         in practical deployments compared to state-of-the-art AR
+                    pose DAWN, a training-free, dependency-aware              models (Wu et al., 2025b; Li et al., 2025b). These gaps are
+                    decoding method for fast dLLM inference. DAWN             largely attributed to two main factors: KV-Cache manage-
+                    extracts token dependencies and leverages two             ment(Wuetal.,2025b;Maetal.,2025;Liuetal., 2025b)
+                    key motivations: (1) positions dependent on un-           and nonindependent position predictions (Song & Zhou,
+                    masked certain positions become more reliable,            2025; Wu et al., 2025b). First, dLLMs employ bidirectional
+                    (2) simultaneously unmasking strongly coupled             attention, which fundamentally contradicts the causal as-
+                    uncertain positions induces errors. Given those           sumption underlying standard KV-Cache mechanisms. Sec-
+                    findings, DAWN leverages a dependency graph to            ond, the marginal distributions at each position produced by
+                    select more reliable unmasking positions at each          dLLMsoftenviolate the independence assumption underly-
+                    iteration, achieving high parallelism with negli-         ing parallel decoding.
+                    gible loss in generation quality. Extensive ex-           This work aims to improve the efficiency of parallel decod-
+                    periments across multiple models and datasets             ingindLLMs,withaparticularfocusonnonindependentpo-
+                    demonstrate that DAWN speedups the inference              sition predictions. Most existing parallel decoding strategies
+                    by 1.80 - 8.06× over baselines while preserv-             (Wu et al., 2025b; Ben-Hamu et al., 2025) select masked
+                    ing the generation quality. Code is released at           positions using heuristics and relatively coarse-grained cri-
+         arXiv:2602.06953v1  [cs.CL]  6 Feb 2026https://github.com/lizhuo-luo/DAWN.teria, such as confidence and entropy, to ensure that the se-
+                                                                              lected positions behave approximately independently. How-
+                                                                              ever, overly conservative selection criteria can substantially
+               1. Introduction                                                limit the achievable parallelism, leaving much of the po-
+               Diffusion models have achieved remarkable success in           tential efficiency of parallel decoding underexploited. To
+               image (Podell et al., 2023; Xie et al., 2024) and video        address this problem, a natural alternative is to account for
+              (Blattmann et al., 2023; Kong et al., 2024) generation, and     positional relationships more directly. Since the main dif-
+                                                                              ficulty stems from position coupling, improving parallel
+                  1Nanyang Technological University 2AUMOVIO-NTU Cor-         decoding requires approximating positional dependencies
+               porate Lab, Nanyang Technological University 3Southern Uni-    during inference rather than evaluating each position in iso-
+              versity of Science and Technology 4SIGS, Tsinghua University    lation. Attention maps (Zhang et al., 2025a; 2024) provide
+               5AUMOVIOSingapore Pte. Ltd.. Correspondence to: Tianwei        an approximate yet cheap signal of token interactions that
+               Zhang<tianwei.zhang@ntu.edu.sg>.                               is readily available from each forward pass, making them a
+              Preprint. February 9, 2026.                                     practical proxy for dependency estimation. From this per-
+                                                                           1
+                                              DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+               spective, two observations are particularly relevant: (i) we    • We propose DAWN, a training-free, dependency-aware
+               verify that dLLMs can exhibit abnormal attention concen-           method for fast inference of diffusion LLMs. It uses
+               tration patterns (akin to attention sinks (Xiao et al., 2024;      the estimated dependencies in two ways: relaxing con-
+               Rulli et al., 2025)) that are largely semantically irrelevant,     fidence thresholds for positions anchored by committed
+               which mislead the attention-based dependency estimates;            high-confidence tokens, and preventing strongly coupled
+               and (ii) positions that are strongly dependent to previously       low-confidence positions from being unmasked together,
+               unmasked high-confidence tokens can remain highly con-             thereby enabling more efficient inference.
+               sistent with the final output even when their confidence is     • Extensive experiments across multiple models, datasets,
+               relatively low. Moreover, avoiding simultaneous unmask-            andrepresentative baselines demonstrate the effectiveness
+               ing of strongly coupled low-confidence positions can sub-          of DAWN, achieving 1.80 - 8.06× speedup over the base-
+               stantially reduce errors induced by parallel decoding under        line. Ablation studies further validate the contributions of
+               marginal probabilities. These observations provide a new           each component and the impact of key hyperparameters.
+               insight: dependency-aware inference rules can expand safe
+               parallelism beyond those conservative threshold methods.        2. Preliminaries
+               Motivated by this, we propose DAWN, a training-free
+               Dependency-AWare fast inference method for diffusioN            2.1. Inference Process of dLLMs
+               LLMs. It improves parallel decoding by explicitly account-      Mostrecent diffusion LLMs adopt the discrete masked dif-
+               ing for position dependency. DAWN consists of three co-         fusion model paradigm (Shi et al., 2025; Sahoo et al., 2024),
+               operating components: Dependency Graph Construction,            where generation is cast as an iterative unmasking process.
+               Anchor-Guided Decoding, and Conflict-Based Scheduling.          Unlike autoregressive models that commit tokens sequen-
+               At each denoising iteration, a dependency graph is con-         tially, dLLMs start from a heavily masked sequence and
+               structed from processed attention maps via thresholding,        progressively recover masked positions over several denois-
+               which captures salient token coupling relations. Based          ing steps until no [MASK] remains. At each step, the model
+               on this graph, the subsequent two components select two         predicts token distributions for all masked positions, condi-
+               disjoint sets of positions for parallel updates, U      and
+                                                                 anchor        tioned on the current state.
+               U      .  Anchor-Guided Decoding first selects approxi-
+                conflict
+               mately independent high-confidence positions, and then          Given a prompt X, we initialize the response as a fully
+               treats previously unmasked high-confidence tokens as an-        maskedsequence of predefined length L:
+               chors and relaxes the confidence threshold for strongly
+               anchor-coupled masked positions. Conflict-Based Schedul-          y(0) = ([MASK],...,[MASK]) ∈ (V ∪{[MASK]})L.
+               ing identifies conflicts in the dependency graph and greedily   Here, V denotes the vocabulary and [MASK] is the special
+               constructs a large non-conflicting update set from the re-      mask token. In the naive setting, the sampler unmasks
+               mainingcandidatesthatsatisfy a lower confidence threshold.
+               Positions in U(t)  ∪ U(t)     are then unmasked in parallel.    exactly one token with the highest confidence per step. At
+                             anchor    conflict                                each denoising step t = 0,1,...,L − 1, it concatenates the
+               Compared with prior approaches that rely on strict posi-        prompt X and the current response state y(t) as the model
+               tional criteria, DAWN relaxes selection constraints by incor-   input, and commits the corresponding token at the [MASK]
+               porating dependency information, thereby enabling addi-         response position with the highest confidence:
+               tional unmasking that would otherwise be filtered out while
+               preserving generation quality. Meanwhile, it substantially           c(t) ≜ maxp (y = v | X,y(t)),        i ∈ M(t),
+               mitigates failures caused by nonindependent position pre-             i      v∈V θ i
+               dictions during parallel decoding. Extensive experiments                                (t)
+                                                                                      it = arg max c      ,
+               validate that DAWN improves the quality–speed trade-off of                      i∈M(t) i
+               dLLMinferenceacross multiple models and settings.                           (argmaxp (y =v |X,y(t)), ifi = i ,
+                                                                                 y(t+1) =         v∈V θ i                             t
+               Themaincontributions are summarized as follows:                     i         y(t),                            otherwise.
+                                                                                               i
+               • Weshowthattokendependencies can be estimated from                                    (t)
+                                                                               where M(t) ≜ {i | y        = [MASK]} denotes the set of
+                 attention maps during inference, enabling more aggres-                               i
+                 sive parallel decoding. We identify two key findings: (1)     maskedresponse positions at step t. Repeating this proce-
+                 attention sinks—positions that absorb disproportionate        dure for L steps yields a fully unmasked response y(L).
+                 attention regardless of semantics—distort dependency es-      Despite the inherent parallelism within each step, practical
+                 timates and must be filtered; (2) once a high-confidence      dLLMinference exhibits a pronounced quality–speed trade-
+                 token is committed, positions that depend on it become        off (Qian et al., 2026): directly unmasking multiple tokens
+                 reliably predictable, even at lower confidence.               in one step leads to substantial quality degradation.
+                                                                            2
+                                                DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+                      /D\HU6WHS               /D\HU6WHS             'LVWULEXWLRQRI$WWQ6FRUHV     )UHTXHQF\RI6LQN7RNHQV
+               Figure 1. Attention Sinks in dLLMs. We conduct experiments on multiple samples using LLaDA-8B-Instruct. Left: The two heatmaps
+               showpartial attention maps from the same layer at different denoising steps, illustrating that the attention sink shifts across denoising
+               iterations. Right: The third plot reports the distribution of attention scores corresponding to the first plot, and the rightmost plot reports the
+               frequency of sink tokens from multiple samples.
+               2.2. Nonindependent Position Predictions
+               Unmaskingasingle token per step is inherently slow, and
+               runs counter to the full position computation paradigm of
+               dLLMs,whereeachdenoisingstepproducespredictions for
+               all positions simultaneously. A common approach is to com-
+               mit tokens at different positions independently according to
+               the model’s predictive distributions at each position:
+                                                                                     &RQILGHQFH
+                                        (t)     Y                 (t)
+                   p   {y }     (t) | X,y     ≈        p   y | X,y       ,
+                    θ     i i∈U                          θ   i
+                                                                                                                                                &RQVLVWHQF\5DWLR
+                                                 i∈U(t)                              $QFKRU
+               where U(t) ⊆ M(t) is a set of parallel unmasking posi-
+               tions. However, position predictions in masked refinement
+               are often statistically coupled. Committing multiple tokens
+               at strongly coupled positions in the same step can intro-                        &RQILGHQFHRI,QGXFHG3RLVWLRQV
+               duce inconsistencies and degrade generation quality. As            Figure 2. Heatmap of Induced Consistency We conduct ex-
+               the classic example in prior work (Song & Zhou, 2025; Wu           periments with LLaDA-8B-Instruct on sampled instances from
+               et al., 2025b), two-word poker hands (e.g., “high card,” “two      GSM8KandHumanEval. Foreachrequest,weidentifycoupled
+               pair,” “full house,” “straight flush”) must match as a pair,       pairs where anchors (prompts or previously unmasked tokens)
+               while parallel sampling can produce invalid combinations           influence induced positions (currently masked positions), and mea-
+               such as “high house”. However, if we first decode one of           sure whether each induced token’s prediction matches the final
+                                                                                  decoded output (consistency ratio). Gray cells indicate bins with a
+               themlike “[MASK] house”, then the probability of recov-            negligible fraction of samples and are excluded from analysis.
+               ering a valid pair in the next step becomes much higher,
+               which aligns with the conditional probability factorization:
+               p(y ,y    | X,y(t)) = p(y | X,y(t))p(y | y ,X,y(t)).               tribution of concentration is not static. The specific sink
+                   i  j                     j                i     j
+               This nature of dLLMs suggests that parallel updates should         tokens and the strength of aggregation can shift as the de-
+               account for position dependencies, avoiding strongly cou-          noising step progresses. However, this phenomenon appears
+               pledpositionswhileincreasingthenumberofsafelyupdated               largely unrelated to the semantics of sink tokens. As shown
+               positions per step.                                                in Fig. 1, each heatmap exhibits an abnormal concentration
+                                                                                  of attention mass. Comparing attention maps across denois-
+               3. Observations                                                    ing steps further indicates that the sink location shifts over
+                                                                                  iterations. In the rightmost plot, most identified sink tokens
+               3.1. Attention Sinks Bias Dependency Proxies                       are punctuation marks or special tokens with little lexical
+               Attention sinks (Xiao et al., 2024; Rulli et al., 2025) are        meaning, suggesting that attention-sink formation is largely
+               commonindLLMs. Acrossmultiplemethodsanddiverse                     independent of token semantics.
+               samples, we repeatedly observe an abnormal concentration           Attention sinks can be problematic when attention maps are
+               of attention on a small subset of keys. Moreover, the dis-         used as a proxy for token dependencies. Sink tokens attract
+                                                                               3
+                                                  DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+                                                                                                                                      /RZ$WWQ6FRUHV
+                       G//0V
+                                                                                                                         
+                                                                                  
+                                                                                                                                      +LJK$WWQ6FRUHV
+                                                                                                                                      7ULPHG$WWQ6FRUHV
+                                                                                                                                      8QPDVNHGRU3URPSW
+                                                                                                                                      3RVLWLRQV
+                                                                                                                         
+                                                                                  
+                                                                                                                                      ([WUHPH+LJK&RQI
+                                                                                                                                      3RVLWLRQV
+                                         $QFKRU*XLGHG'HFRGLQJ
+                                                                                                                                      ([WUHPH/RZ&RQI
+                                                                                                                                      3RVLWLRQ
+                                                                                                                                   
+                                                                                                                                      &RQILGHQFH
+                                                                                                                                      6HOHFWHG3RVLWLRQV
+                       *UDSK
+                     &RQVWUXFWLRQ
+                                                                                                                            
+                                                                                                                    
+                                                                                  
+                                                                                                                                       5HIXVHG3RVLWLRQV
+                                                                                                                                       3RV1RW&RQVLGHUHG
+                                         &RQIOLFW%DVHG6FKHGXOLQJ
+                                                                                                                                       'HSHQGHQF\(GJHV
+                                                                                                                                       (GJHV1RW&RQVLGHUHG
+                                                                                                                         
+                                                                                  
+                                                                                                                                       (GJHV,JQRUHG
+                                                                                                                                       EHWZHHQKLJKFRQI
+                                                                                                                                       SRVLWLRQV
+                                                                            1H[W,WHUDWLRQ
+                Figure 3. Overview of DAWN. Left: Dependency Graph Construction preprocesses the attention map and extracts a sparse directed
+                dependency graph by retaining only salient (high-score) attention links. Middle: guided by this graph, Anchor-Guided Decoding and
+                Conflict-Based Scheduling select two sets of positions, and the union of selected positions is unmasked simultaneously.
+                a large amount of attention and can be misinterpreted as              of token dependencies based on attention maps. Anchor-
+                exerting strong influence over many other tokens.                     Guided Decoding first selects high-confidence masked posi-
+                                                                                      tions that are approximately independent, and then leverages
+                3.2. High-Confidence Positions as Anchors                             high-confidence prompts or committed positions as anchors,
+                During dLLMinference, masked positions can exhibit high               enabling strongly coupled positions (induced positions) to
+                consistency even when their confidence is not particularly            be unmasked with a relatively low confidence. These to-
+                                                                                      gether produce a parallel set U(t)        .  For the remaining
+                high. More importantly, we find that the induced positions                                                 anchor
+                that are strongly dependent on prompts or previously un-              tokens, Conflict-Based Scheduling uses conflict relations
+                masked tokens with high confidence (anchors) often exhibit            induced by the dependency graph to select a maximum in-
+                                                                                      dependent set U(t)       from positions that meet a lower con-
+                high consistency despite relatively low instantaneous con-                              conflict
+                fidence. This is validated by the highlighted region in the           fidence threshold. Finally, the positions in U(t)      ∪ U(t)
+                                                                                                                                       anchor     conflict
+                upper area of Fig. 2: the induced positions can remain con-           are unmasked in parallel in this iteration. These three mod-
+                sistent with the final output when their confidence is low. In        ules are pipelined within each denoising iteration to enable
+                particular, when the corresponding anchors have confidence            accurate and efficient inference. The following subsections
+                above 0.9, the induced tokens are consistently correct at a           describe their mechanisms in detail.
+                relatively low confidence. Therefore, the safety of parallel
+                updatesdependsnotonlyonconfidence,butalsoonwhether                    4.1. Dependency Graph Construction
+                the prediction is sufficiently conditioned on reliable context.       Manyprior works (Chen et al., 2024; Zhang et al., 2025a;
+                4. Methodology                                                        2024; Xi et al., 2025) use attention maps to characterize
+                                                                                      interactions among tokens, thereby enabling more efficient
+                Driven by the observations, we propose DAWN, a training-              inference. Inspired by these applications, we treat attention
+                free, dependency-aware solution to accelerate dLLM infer-             mapsasalightweight, approximate proxy for token depen-
+                ence while maintaining the generation quality. The key idea           dencies during decoding. This coupling signal is readily
+                is to extract positional dependencies and leverage themtose-          available from each forward pass and can be converted into
+                lect a larger set of reliable positions for update at each itera-     a sparse directed dependency graph, which serves as the
+                tion. DAWN realizes efficient inference by three cooperating          basis for subsequent efficient scheduling.
+                modules, as shown in Fig 3. Dependency Graph Construc-                Since attention patterns evolve across denoising iterations,
+                tion builds a sparse directed graph from a lightweight proxy          the dependency graph is constructed at each iteration from
+                                                                                   4
+                                               DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+               the model’s attention maps. To obtain a signal that is closer     sponding induced positions to be unmasked at lower con-
+               to the final prediction and less noisy, attention weights are     fidence. Accordingly, the set of positions eligible to be
+               averaged across the last few layers and all heads. As dis-        unmaskedatthe denoising step t is defined as:
+               cussed in Sec. 3.1, dLLMs often exhibit attention sinks,                                        (t)               
+                                                                                           (t)           i ∈ M    , c ≥ τ      or
+               where a small set of positions absorbs most of the attention              U      = i                  i     high      .
+                                                                                          anchor         i ∈ I(t), c ≥ τ
+               massduetosystematic bias rather than semantic relevance.                                              i    induced
+               This can lead to misleading dependent relations when at-          whereτ          is the confidence threshold for unmasking in-
+               tention is used as a proxy for dependency. To mitigate                    induced
+               this effect, sink positions are identified via outlier detection  duced positions. Overall, Anchor-Guided Decoding selects
+               and filtering of their incoming attention mass: given an ag-      approximately independent positions under a high confi-
+               gregated attention matrix A(t) ∈ RL×L at iteration t, the         dence threshold and relaxes the threshold for induced posi-
+               incoming attention mass of position j is defined as               tions, enabling more efficient inference.
+                                               L                                 4.3. Conflict-Based Scheduling
+                                     (t)    1 X (t)
+                                    ¯
+                                   Aj = L         Ai,j,                          For the remaining positions that are strongly coupled and
+                                              i=1                                satisfy a lower confidence threshold τ      , simultaneously
+                                                                                                                         low
+                                                         (t)                     unmasking them may introduce inconsistent commitments,
+                                                        ¯
+               and position j is marked as a sink if Aj     is larger than a     as discussed in Sec. 2.2. To mitigate such errors while
+               predefined threshold τ     . Self-attention on the diagonal is
+                                      sink                                       retaining high parallelism, Conflict-Based Scheduling is
+               ignored as it does not capture cross-position dependencies.       introduced to prevent lower-confidence but highly coupled
+               Given the processed attention proxy at iteration t, a directed    positions from being decoded in the same step.
+               sparse dependency graph is constructed to capture salient         Since the dependency graph captures salient positional de-
+               token couplings during decoding. Specifically, to keep the        pendencies, it can be used to identify strongly coupled po-
+               graph sparse and focus on the most informative relations,         sition pairs. A conflict relation is defined between two
+               edges are retained based on thresholded (τ        ) attention
+                                                             edge                positions connected by an edge in the dependency graph,
+               scores. A directed edge j →i is added if query position i         regardless of direction: if either i → j or j → i is present,
+               places a sufficiently large attention mass on key position j,     then positions i and j are considered to be in conflict and
+               indicating that the prediction at token i can be significantly    should not be unmasked simultaneously.
+               conditioned by token j. The resulting graph provides an
+               approximate representation of positional dependencies and         Algorithm 1 shows the detailed procedure. Specifically, at
+               will be used by subsequent modules.                               iteration t, based on these conflicts and the graph topology,
+                                                                                 a greedy independent set is constructed from the remaining
+               4.2. Anchor-Guided Decoding                                       positions that (i) are not yet included in and not conflicting
+                                                                                 neighbors of U(t)     , and (ii) satisfy a lower confidence
+               Prior work (Wu et al., 2025b) suggests that sufficiently high-                     anchor
+               confidence positions are approximately independent as well        threshold, yielding additional positions that can be decoded
+               as non-conflicting, motivating a high conservative threshold      in parallel. Concretely, positions are greedily selected in
+                                                                                 descending order of confidence: the highest-confidence po-
+               τ     for selecting them for parallel updates, where τ                                                (t)
+                high                                                    high     sition is added to the update set U      , and all of its con-
+               is usually set to 0.9. Meanwhile, some low-confidence to-                                             conflict
+               kens at masked positions can still be consistent with the         flicting neighbors are removed from further consideration.
+               final response, indicating that only confidence thresholding      This procedure repeats until no candidate positions remain.
+               remains a limit for dLLM inference. Motivated by this,            In practice, quality degradation from naively lowering the
+               Anchor-Guided Decoding is introduced to accept approxi-           confidencethresholdislargelydrivenbypositionalcoupling.
+               mately independent positions and reliable positions under a       Byexplicitly avoiding simultaneous unmasking of strongly
+               relaxed confidence criterion.                                     coupled positions, Conflict-Based Scheduling helps main-
+               Asdiscussed in Sec. 3.2, low-confidence positions that are        tain decoding quality while allowing a lower confidence
+                                                                                 threshold τ    , thus speeding up the inference.
+               strongly coupled to previously unmasked positions meet the                   low
+               confidence threshold τ       and often match the final result.
+                                      high                                       5. Experiments
+               Following this observation, we define anchors as positions
+               that have been unmasked and their confidence meets τ         .
+                                                                        high     5.1. Setups
+               Using the dependency graph, we identify the induced posi-
+               tions I as masked positions that are reachable via directed       Models and Benchmarks. We evaluate our approach on
+               edges from anchor tokens. Intuitively, higher-confidence          several variants of two models: LLaDA-8B-Instruct (Nie
+               anchors provide more reliable context, allowing the corre-        et al., 2025), LLaDA-1.5 (Zhu et al., 2025), Dream-v0-Base-
+                                                                              5
+                                                DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+               Algorithm 1 Conflict-Based Scheduling                              Overall, DAWN achieves a substantial improvement in in-
+                 1: Input: remaining candidate positions C(t), anchor up-         ference speed while maintaining accuracy comparable to
+                    date set U(t)   , confidence scores {c }        , conflict    or even slightly higher than the original method. DAWN
+                               anchor                       i i∈C(t)              achieves substantially higher throughput than prior decod-
+                    neighbors {N(i)}       (t), lower threshold τ
+                                       i∈C                       low              ing baselines, with up to 8.06× speedup on MBPP using the
+                 2: Output: parallel update set U(t)
+                                                   conflict                       LLaDA-1.5 model. Moreover, these gains do not come at
+                 3: Initialize U(t)   ←∅                                          the cost of quality. On LLaDA-8B-Instruct, DAWN achieves
+                                conflict S
+                 4: X ← U(t)        ∪              N(i) {selected positions       77.94 accuracy on GSM8K, matching the original method,
+                            anchor      i∈U(t)
+                    and their conflicts}    anchor                                and attains 30.80 on MBPP, slightly higher than the original
+                 5: R ← {i ∈ C(t) | c ≥ τ          } \ X {remaining candi-        29.60. In other settings, DAWN incurs only negligible quality
+                                         i     low                                loss, indicating a more favorable quality–speed trade-off.
+                    dates}
+                 6: while R ̸= ∅ do                                               Compared with confidence-aware parallel and KLASS,
+                              ⋆
+                 7:   Select i ← argmax           c                               DAWN significantly improves throughput while achieving
+                        (t)         (t)      i∈R i
+                 8:   U        ←U         ∪{i⋆}                                   nearly identical accuracy. Compared with LocalLeap, DAWN
+                        conflict    conflict
+                                     ⋆         ⋆                                  shows clear advantages in both quality and speed: across
+                 9:   R←R\({i }∪N(i ))                                            most benchmarks, it improves throughput by approximately
+               10: end while
+               11: return U(t)                                                    0.05 – 5.17 tokens per second while enhancing accuracy
+                             conflict                                             by up to 3.04%. It unlocks additional safe parallelism by
+                                                                                  explicitly accounting for positional dependencies during
+                                                                                  refinement, enabling more efficient decoding.
+               7B (Ye et al., 2025), Dream-v0-Instruct-7B. Benchmarks
+               include diverse datasets: GSM8K (5-shot) (Cobbe et al.,            5.3. Ablation Study
+               2021),MATH(4-shot)(Hendrycksetal.,2021),HumanEval                  Weconductextensiveablation studies to assess the contribu-
+               (0-shot) (Chen, 2021), and MBPP (3-shot) (Austin et al.,           tions of key components in DAWN. We further examine the
+               2021), covering a range of reasoning and code generation           sensitivity of DAWN to the generation length and the lower
+               tasks. We report tokens per second (TPS), relative speedup         confidence threshold τ       to understand how these factors
+               ratio (Speedup) and number of function evaluations (NFE)                                    low
+               to reflect efficiency, along with task accuracy (Acc.).            affect its effectiveness. Discussions of other hyperparameter
+                                                                                  choices are provided in Appendix A. All other experiment
+               Baselines. We compare DAWN against four baselines: the             settings follow the main experiment.
+               Original sampling method (Top-1 Sampling), which un-               Effectiveness of key components. Since Dependency
+               masks the top-1 confidence position at each iteration; the         GraphConstruction serves as the foundation for the other
+               Confidence-Aware Parallel proposed by Fast-dLLM (Wu                two modules, we focus on validating the effectiveness of
+               et al., 2025b), selecting positions whose confidence exceeds       components for selecting parallel update positions. Ta-
+               a predefined threshold; KLASS (Kim et al., 2025), using            ble 2 summarizes ablations of DAWN on two representa-
+               both confidence and KL divergence to select positions; and         tive dLLMs and benchmarks. Overall, the full solution
+               LocalLeap (Kong et al., 2025), identifying anchors and per-        consistently improves efficiency while maintaining com-
+               forming localized relaxed parallel decoding.                       parable accuracy. In particular, removing Anchor-Guided
+               HardwareandImplementationDetails. Our experiments                  Decoding (AGD) causes a substantial efficiency drop across
+               are conducted on a NVIDIA H100 80G GPU. We set the                 both models and tasks. On LLaDA-8B-Instruct, TPS de-
+               generation length to 256 and the block length to 32 for all        creases from 44.72 to 22.31 on GSM8K, indicating that
+               methods except KLASS, which uses its best-performing               AGDisaprimarycontributor to the speedup by expanding
+               block length. All baselines are evaluated under their de-          the set of positions that can be safely unmasked under reli-
+               fault hyperparameter settings. For DAWN, we average the            able anchor context. On Dream-v0-Instruct-7B, removing
+               attention maps from the last 4 layers. τ       is set to 0.9 ac-   Conflict-Based Scheduling (CBS) yields higher accuracy
+                                                         high
+               cording to Fast-dLLM. Confidence thresholds are set from           but lower efficiency, suggesting that CBS mainly unlocks
+               0.7 to 0.85. Full configurations and the justifications can be     additional parallelism by avoiding inconsistent joint updates
+               found in Appendix A. All evaluations are conducted using           amongstrongly coupled positions, trading a small amount
+               the standardized lm-eval (Gao et al., 2024) library.               of accuracy for further acceleration.
+               5.2. Main Results                                                  Impactofgenerationlength. Figure 4 reports the accuracy
+                                                                                  and throughput of DAWN and the original baseline with dif-
+               Table 1 reports the accuracy and efficiency of each method         ferent generation lengths L. Across both LLaDA and Dream
+               across different models on four benchmarks.                        models, DAWN consistently improves throughput over the
+                                                                               6
+                                                    DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+                Table 1. Performance comparison between DAWN and baselines across 4 datasets and 4 models. We report Accuracy, TPS, and
+                 Speedup to assess their efficiency and generation quality.
+                                           GSM8K                           MATH                         HumanEval                         MBPP
+                     Method      Acc.↑    TPS↑     Speedup↑     Acc.↑    TPS↑     Speedup↑     Acc.↑     TPS↑     Speedup↑     Acc.↑    TPS↑     Speedup↑
+                                                                             LLaDA-8B-Instruct
+                    Original     77.94    10.32      1.00×      33.20    14.10      1.00×      40.24     26.46      1.00×      29.60     9.46      1.00×
+                   Confidence    78.39    33.44      3.24×      32.98    36.88      2.62×      40.85     86.73      3.28×      30.00    34.81      3.68×
+                    KLASS        76.12    23.23      2.25×      32.32    25.27      1.79×      36.59     56.91      2.15×      27.00    22.62      2.39×
+                   LocalLeap     77.33    44.19      4.28×      32.42    47.12      3.34×      39.63    109.80      4.15×      30.80    44.13      4.66×
+                     DAWN        77.94    44.72      4.33×      32.36    48.16      3.42×      40.24    108.99      4.12×      30.80    45.17      4.77×
+                                                                                 LLaDA-1.5
+                    Original     81.12     9.65      1.00×      33.36    12.75      1.00×      43.90     9.26       1.00×      38.80     3.45      1.00×
+                   Confidence    80.74    32.49      3.37×      33.38    32.87      2.58×      42.68     23.39      2.53×      38.80    20.40      5.91×
+                    KLASS        77.63    22.63      2.35×      31.80    23.29      1.83×      39.63     16.49      1.78×      30.00    13.25      3.84×
+                   LocalLeap     80.14    42.60      4.41×      32.44    42.36      3.32×      42.07     30.21      3.26×      39.20    27.00      7.83×
+                     DAWN        80.82    43.24      4.48×      31.80    42.84      3.36×      42.07     29.53      3.19×      37.60    27.80      8.06×
+                                                                             Dream-v0-Base-7B
+                    Original     76.42    14.37      1.00×      34.70    18.16      1.00×      38.41     20.90      1.00×      53.40    11.85      1.00×
+                   Confidence    73.84    23.41      1.63×      34.38    44.66      2.46×      39.63     61.54      2.94×      53.80    50.37      4.25×
+                    KLASS        72.00    12.58      0.88×      32.80    23.16      1.27×      42.68     31.32      1.50×      55.80    19.46      1.64×
+                   LocalLeap     72.55    25.40      1.77×      34.48    51.32      2.83×      36.59     68.28      3.27×      53.60    59.38      5.01×
+                     DAWN        73.54    25.88      1.80×      34.00    51.45      2.83×      39.63     68.96      3.29×      53.20    64.55      5.45×
+                                                                            Dream-v0-Instruct-7B
+                    Original     76.35     7.30      1.00×      37.80    17.73      1.00×      53.66     22.66      1.00×      54.20     8.37      1.00×
+                   Confidence    75.20    28.81      3.95×      38.24    37.92      2.14×      57.32     52.11      2.30×      55.60    39.09      4.67×
+                    KLASS        71.72    12.93      1.77×      34.66    18.74      1.06×      54.88     26.71      1.18×      56.80    18.53      2.21×
+                   LocalLeap     73.24    32.94      4.51×      38.10    43.66      2.46×      54.27     59.28      2.62×      55.00    42.71      5.10×
+                     DAWN        73.16    32.99      4.52×      38.22    44.18      2.49×      54.88     60.23      2.66×      55.80    44.03      5.26×
+                Table 2. Ablation study on the effectiveness of key modules in                   Ori (Acc)    DAWN (Acc)       Ori (TPS)      DAWN (TPS)
+                 DAWNacross2datasetsand2models. WereportAccuracy, TPS,                       100                            100                         80
+                 and NFE to assess their quality and speed. The settings are the                                         120
+                 sameasinthemainexperiments.                                                  80                         100 80                         60
+                                                                                              60                         80  60
+                                      GSM8K                     HumanEval                                                60                             40  TPS
+                                                                                              40                             40
+                   Method     Acc.↑     TPS↑     NFE↓     Acc.↑    TPS↑     NFE↓            Accuracy                     40                             20
+                                        LLaDA-8B-Instruct                                     20                         20  20
+                                                                                              0                               0                         0
+                    DAWN       77.94    44.72    55.76    40.24    109.0    61.63                 128   256   512  1024          128   256   512   1024
+                    - AGD      76.80    22.31    112.9    41.46    51.51    131.0                Generation length              Generation length
+                    - CBS      78.47    33.83    74.69    41.46    92.52    72.93        Figure 4. Effectiveness of DAWN and the original sampler
+                   Original    77.94    10.32     256     40.24    26.46     256         on HumanEval under different generation lengths (L ∈
+                                       Dream-v0-Instruct-7B                              {128,256,512,1024}). Bars report accuracy (left y-axis) and
+                    DAWN       73.16    32.99    51.92    54.88    60.23    77.12        solid lines report TPS (right y-axis). Left and right figures corre-
+                    - AGD      73.31    29.33    58.13    54.88    54.79    83.34        spond to LLaDA-8B-Instruct and Dream-v0-Instruct-7B.
+                    - CBS      75.28    27.63    62.19    57.31    51.97    93.01
+                   Original    76.35    7.30      256     53.66    22.66     256
+                                                                                         the block length increases, throughput increases for both
+                                                                                         methods as higher parallelism, but accuracy first increases
+                 original sampler while maintaining comparable accuracy.                 and then decreases. Overall, it preserves a robust quality-
+                AsLincreases, throughput decreases for both methods due                  speed trade-off across a wide range of lengths.
+                 to higher denoising costs, yet DAWN continues to boost the              Impactoflowerthreshold. Figure 6 reports the evaluation
+                 efficiency. Overall, it preserves a more favorable quality-             under different values of lower threshold τ          . We observe
+                 speed trade-off across a wide range of lengths.                                                                          low
+                                                                                         a clear quality-speed trade-off on both models. Reducing
+                 Impact of block length. Figure 5 reports the accuracy                   τ     increases TPS by admitting more parallel updates, but
+                                                                                           low
+                 and throughput of DAWN with different block lengths. As                 can hurt accuracy due to less reliable low-confidence com-
+                                                                                      7
+                                                                           DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+                                                                        56.0                                     62              dLLMs(Youetal.,2025;Yangetal.,2025a)demonstrate
+                             41                                     110                                          60              strong performance across a variety of tasks and point to-
+                             40                                         55.5                                     58             ward more unified diffusion-based generative models.
+                                                                    100                                          56    TPS
+                             39                                         55.0                                     54              Efficient Inference of dLLMs. Despite dLLMs’s ability to
+                           Accuracy                                 90                                                           update multiple positions in parallel, they still face practical
+                                                                        54.5                                     52              challenges during inference, motivating more efforts on
+                             38                                     80                                           50
+                                8.0       16.0       32.0      64.0          8.0       16.0       32.0      64.0                 faster and more reliable decoding.
+                                       Block length                                 Block length                                 Existing works focus on the KV Cache optimization (Wu
+                       Figure 5. Effectiveness of DAWN on HumanEval under different                                              et al., 2025b; Ma et al., 2025), early stopping (Yang et al.,
+                        block lengths (L ∈ {8,16,32,64}). We report accuracy (blue,                                              2025b;Lietal.,2025a),distillation-based(Chenetal.,2025)
+                        left y-axis) and TPS (red, right y-axis). Left and right figures                                         acceleration, and others (Zhang et al., 2025b; Song et al.,
+                        correspond to LLaDA-8B-Instruct and Dream-v0-Instruct-7B.                                                2025a; Luo et al., 2026). These directions have shown
+                                                                                                                72.5             promising gains in improving the efficiency of dLLM infer-
+                            40                                      130 54                                                       ence. Beyond these optimizations, numerous studies have
+                            38                                      125                                         70.0
+                                                                    120 52                                      67.5             explored optimized sampling strategies for dLLM inference.
+                            36                                                                                  65.0             Fast-dLLM (Wu et al., 2025b) adopts a confidence-aware
+                                                                    115 50
+                            34                                      110                                         62.5   TPS       strategy that unmasks multiple positions when their scores
+                           Accuracy32                               105 48                                      60.0             are sufficiently high, thereby making the independence ap-
+                            30                                      100                                         57.5
+                                0.65   0.70    0.75    0.80    0.85      46 0.65    0.70    0.75    0.80   0.85                  proximation more reliable. EB-Sampler (Ben-Hamu et al.,
+                                      Threshold  low                               Threshold  low                                2025) uses the entropy of predictive distributions to decide
+                       Figure 6. We vary the lower threshold τ                            andreportaccuracy                     which positions are safe to update in parallel. KLASS (Kim
+                                                                                    low                                          et al., 2025) further incorporates temporal stability by com-
+                       (blue, left y-axis) and throughput TPS (red, right y-axis) on                                             paring distributions across iterations via the KL divergence.
+                        HumanEval. The left and right figures correspond to LLaDA-                                              WINO(Hongetal.,2025)followsadraft-and-verify style:
+                        8B-Instruct and Dream-v0-Instruct-7B. The dashed line (yellow)
+                        marks the default setting τ                  =0.80.                                                      it drafts many tokens in parallel and selectively regener-
+                                                               low
+                                                                                                                                 ates those that fail verification. Spiffy and related works
+                                                                                                                                (Agrawal et al., 2026; Wei et al., 2025) apply speculative
+                        mitments. The default τ                       =0.80(dashedline) maintains
+                                                               low                                                               decoding style strategies to dLLMs to accelerate diffusion
+                        a high generation quality and improved efficiency.                                                       decoding. LocalLeap (Kong et al., 2025) leverages a local
+                                                                                                                                 determinism hypothesis, observing that positions adjacent
+                        6. Related Work                                                                                          to high-confidence commits tend to stabilize earlier and can
+                                                                                                                                 therefore be updated more aggressively. Unlike the above
+                        Diffusion Large Language Models. Autoregressive (AR)                                                     methods, this work explicitly approximates token coupling
+                        models have long been the dominant paradigm for natu-                                                    during inference and leverages this approximation to guide
+                        ral language generation, largely due to the discrete and                                                 efficient parallel sampling.
+                        sequential nature of text. In contrast, diffusion models have
+                        achieved remarkable success in continuous domains such as                                                7. Conclusion
+                        image and video generation. Recently, diffusion-based lan-
+                        guage models have gained renewed interest and emerged as                                                Thisworkleadstoabetterquality-speedtrade-offfordLLM
+                        a competitive alternative for text generation, demonstrating                                             inference, narrowing the gap to state-of-the-art language
+                        promising progress across a wide range of tasks.                                                         models in practical generation settings. Specifically, we
+                        Representative approaches include pretraining dLLMs from                                                 propose DAWN, a training-free, dependency-aware fast in-
+                        scratch (Nie et al., 2025) and building dLLMs on top of                                                  ference method for dLLMs. It is primarily motivated by
+                        existing AR models (Ye et al., 2025). In parallel, several                                               the inherent challenge of nonindependent position predic-
+                        commercial systems (Song et al., 2025b; Labs et al., 2025;                                               tions in dLLMs and mitigates this issue by adopting a
+                        Google DeepMind, 2025) highlight the feasibility and prac-                                               positional-dependency perspective, offering a complemen-
+                        tical potential of diffusion-based generation. Beyond these                                              tary approach to alleviate failures in parallel unmasking.
+                        early successes, recent works (Wu et al., 2025a; Bie et al.,                                             Guided by a sparse directed dependency graph, DAWN se-
+                        2025; Liu et al., 2025a) continue to advance dLLMs along                                                 lects unmasking positions at each iteration and enables
+                        multiple dimensions, including scaling to larger model size                                              highly parallel updates while preserving generation quality.
+                        and exploring alternative training-inference paradigms for                                               Extensive experiments across multiple models and datasets
+                        faster refinement. Moreover, diffusion-based modeling has                                               validate the effectiveness of DAWN, demonstrating consistent
+                        been extended to multimodal settings, where multimodal                                                   speedups while maintaining comparable quality.
+                                                                                                                            8
+                                              DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+               8. Impact Statement                                            Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,
+              This paper presents work whose goal is to advance the field        Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,
+               of machine learning. There are many potential societal            R., et al. Training verifiers to solve math word problems.
+               consequences of our work, none of which we feel must be           arXiv preprint arXiv:2110.14168, 2021.
+               specifically highlighted here.                                 Gao,L.,Tow,J.,Abbasi,B.,Biderman,S.,Black,S.,DiPofi,
+                                                                                 A., Foster, C., Golding, L., Hsu, J., Le Noac’h, A., Li,
+               References                                                        H., McDonell, K., Muennighoff, N., Ociepa, C., Phang,
+                                                                                 J., Reynolds, L., Schoelkopf, H., Skowron, A., Sutawika,
+               Agrawal, S., Garrepalli, R., Goel, R., Lee, M., Lott, C., and     L., Tang, E., Thite, A., Wang, B., Wang, K., and Zou, A.
+                 Porikli, F. Spiffy: Multiplying diffusion llm acceleration      Thelanguage model evaluation harness, 07 2024. URL
+                 via lossless speculative decoding, 2026. URL https:             https://zenodo.org/records/12608602.
+                 //arxiv.org/abs/2509.18085.
+                                                                              Google DeepMind.          Gemini diffusion:      Our state-
+               Austin, J., Odena, A., Nye, M., Bosma, M., Michalewski,           of-the-art,   experimental     text   diffusion   model.
+                 H., Dohan, D., Jiang, E., Cai, C., Terry, M., Le, Q., et al.    https://deepmind.google/models/
+                 Program synthesis with large language models. arXiv             gemini-diffusion/, 2025.              Accessed:    2026-
+                 preprint arXiv:2108.07732, 2021.                                01-10.
+               Ben-Hamu, H., Gat, I., Severo, D., Nolte, N., and Karrer,      Hendrycks, D., Burns, C., Kadavath, S., Arora, A., Basart,
+                 B. Accelerated sampling from masked diffusion models            S., Tang, E., Song, D., and Steinhardt, J. Measuring math-
+                 via entropy bounded unmasking, 2025. URL https:                 ematical problem solving with the math dataset. arXiv
+                 //arxiv.org/abs/2505.24857.                                     preprint arXiv:2103.03874, 2021.
+               Berglund, L., Tong, M., Kaufmann, M., Balesni, M., Stick-      Hong,F., Yu, G., Ye, Y., Huang, H., Zheng, H., Zhang, Y.,
+                 land, A. C., Korbak, T., and Evans, O. The reversal curse:      Wang, Y., and Yao, J. Wide-in, narrow-out: Revokable
+                 Llms trained on” a is b” fail to learn” b is a”. arXiv          decoding for efficient and effective dllms. arXiv preprint
+                 preprint arXiv:2309.12288, 2023.                                arXiv:2507.18578, 2025.
+                                                                              Kim, S. H., Hong, S., Jung, H., Park, Y., and Yun, S.-Y.
+               Bie, T., Cao, M., Chen, K., Du, L., Gong, M., Gong, Z.,           Klass: Kl-guided fast inference in masked diffusion mod-
+                 Gu, Y., Hu, J., Huang, Z., Lan, Z., Li, C., Li, C., Li,         els, 2025. URL https://arxiv.org/abs/2511.
+                 J., Li, Z., Liu, H., Liu, L., Lu, G., Lu, X., Ma, Y., Tan,      05664.
+                 J., Wei, L., Wen, J.-R., Xing, Y., Zhang, X., Zhao, J.,
+                 Zheng, D., Zhou, J., Zhou, J., Zhou, Z., Zhu, L., and        Kong, F., Zhang, J., Liu, Y., Wu, Z., Tian, Y., W., V.,
+                 Zhuang, Y. Llada2.0: Scaling up diffusion language              and Zhou, G. Accelerating diffusion llm inference via
+                 models to 100b, 2025. URL https://arxiv.org/                    local determinism propagation, 2025.      URL https:
+                 abs/2512.15745.                                                 //arxiv.org/abs/2510.07081.
+               Blattmann, A., Dockhorn, T., Kulal, S., Mendelevitch, D.,      Kong, W., Tian, Q., Zhang, Z., Min, R., Dai, Z., Zhou, J.,
+                 Kilian, M., Lorenz, D., Levi, Y., English, Z., Voleti, V.,      Xiong, J., Li, X., Wu, B., Zhang, J., et al. Hunyuan-
+                 Letts, A., et al. Stable video diffusion: Scaling latent        video: A systematic framework for large video generative
+                 video diffusion models to large datasets. arXiv preprint        models. arXiv preprint arXiv:2412.03603, 2024.
+                 arXiv:2311.15127, 2023.                                      Labs,I., Khanna,S., Kharbanda,S.,Li,S.,Varma,H.,Wang,
+               Chen, L., Zhao, H., Liu, T., Bai, S., Lin, J., Zhou, C., and      E., Birnbaum, S., Luo, Z., Miraoui, Y., Palrecha, A., et al.
+                 Chang, B. An image is worth 1/2 tokens after layer              Mercury: Ultra-fast language models based on diffusion.
+                 2: Plug-and-play inference acceleration for large vision-       arXiv preprint arXiv:2506.17298, 2025.
+                 language models, 2024. URL https://arxiv.org/                Li, J., Dong, X., Zang, Y., Cao, Y., Wang, J., and Lin, D.
+                 abs/2403.06764.                                                 Beyondfixed: Training-free variable-length denoising for
+                                                                                 diffusion large language models, 2025a. URL https:
+               Chen,M. Evaluatinglarge language models trained on code.          //arxiv.org/abs/2508.00819.
+                 arXiv preprint arXiv:2107.03374, 2021.
+                                                                              Li, Y., Wei, F., Zhang, C., and Zhang, H. Eagle-3: Scal-
+               Chen, Z., Fang, G., Ma, X., Yu, R., and Wang, X. dparallel:       ing up inference acceleration of large language models
+                 Learnable parallel decoding for dllms. arXiv preprint           via training-time test, 2025b. URL https://arxiv.
+                 arXiv:2509.26488, 2025.                                         org/abs/2503.01840.
+                                                                           9
+                                                DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+               Liu, A., He, M., Zeng, S., Zhang, S., Zhang, L., Wu,                   J., Metz, L., Mishchenko, A., Mishkin, P., Monaco, V.,
+                  C., Jia, W., Liu, Y., Zhou, X., and Zhou, J. Wedlm:                 Morikawa,E.,Mossing,D.,Mu,T.,Murati,M.,Murk,O.,
+                                                                                        ´
+                  Reconciling diffusion language models with standard                 Mely, D., Nair, A., Nakano, R., Nayak, R., Neelakantan,
+                  causal attention for fast inference, 2025a. URL https:             A., Ngo, R., Noh, H., Ouyang, L., O’Keefe, C., Pachocki,
+                  //arxiv.org/abs/2512.22737.                                         J., Paino, A., Palermo, J., Pantuliano, A., Parascandolo,
+               Liu, Z., Yang, Y., Zhang, Y., Chen, J., Zou, C., Wei, Q.,              G., Parish, J., Parparita, E., Passos, A., Pavlov, M., Peng,
+                  Wang,S., and Zhang, L. dllm-cache: Accelerating diffu-             A., Perelman, A., de Avila Belbute Peres, F., Petrov, M.,
+                  sion large language models with adaptive caching. arXiv             de Oliveira Pinto, H. P., Michael, Pokorny, Pokrass, M.,
+                  preprint arXiv:2506.06295, 2025b.                                   Pong, V. H., Powell, T., Power, A., Power, B., Proehl, E.,
+                                                                                      Puri, R., Radford, A., Rae, J., Ramesh, A., Raymond, C.,
+               Luo, L., Li, S., Wen, Y., and Zhang, T. Dsb: Dynamic                   Real, F., Rimbach, K., Ross, C., Rotsted, B., Roussez, H.,
+                  sliding block scheduling for diffusion llms, 2026. URL              Ryder,N.,Saltarelli, M., Sanders, T., Santurkar, S., Sastry,
+                  https://arxiv.org/abs/2602.05992.                                   G., Schmidt, H., Schnurr, D., Schulman, J., Selsam, D.,
+                                                                                      Sheppard, K., Sherbakov, T., Shieh, J., Shoker, S., Shyam,
+               Ma, X., Yu, R., Fang, G., and Wang, X. dkv-cache: The                  P., Sidor, S., Sigler, E., Simens, M., Sitkin, J., Slama, K.,
+                  cache for diffusion language models. arXiv preprint                 Sohl, I., Sokolowsky, B., Song, Y., Staudacher, N., Such,
+                  arXiv:2505.15781, 2025.                                             F. P., Summers, N., Sutskever, I., Tang, J., Tezak, N.,
+               Nie, S., Zhu, F., You, Z., Zhang, X., Ou, J., Hu, J., Zhou, J.,       Thompson, M. B., Tillet, P., Tootoonchian, A., Tseng, E.,
+                  Lin, Y., Wen, J.-R., and Li, C. Large language diffusion           Tuggle, P., Turley, N., Tworek, J., Uribe, J. F. C., Vallone,
+                  models. arXiv preprint arXiv:2502.09992, 2025.                     A., Vijayvergiya, A., Voss, C., Wainwright, C., Wang,
+                                                                                      J. J., Wang, A., Wang, B., Ward, J., Wei, J., Weinmann,
+               OpenAI, Achiam, J., Adler, S., Agarwal, S., Ahmad, L.,                 C., Welihinda, A., Welinder, P., Weng, J., Weng, L., Wi-
+                  Akkaya, I., Aleman, F. L., Almeida, D., Altenschmidt, J.,           ethoff, M., Willner, D., Winter, C., Wolrich, S., Wong,
+                  Altman, S., Anadkat, S., Avila, R., Babuschkin, I., Bal-            H., Workman, L., Wu, S., Wu, J., Wu, M., Xiao, K., Xu,
+                  aji, S., Balcom, V., Baltescu, P., Bao, H., Bavarian, M.,          T., Yoo, S., Yu, K., Yuan, Q., Zaremba, W., Zellers, R.,
+                  Belgum, J., Bello, I., Berdine, J., Bernadett-Shapiro, G.,          Zhang, C., Zhang, M., Zhao, S., Zheng, T., Zhuang, J.,
+                  Berner, C., Bogdonoff, L., Boiko, O., Boyd, M., Brakman,            Zhuk, W., and Zoph, B. Gpt-4 technical report, 2024.
+                  A.-L., Brockman, G., Brooks, T., Brundage, M., Button,              URLhttps://arxiv.org/abs/2303.08774.
+                  K., Cai, T., Campbell, R., Cann, A., Carey, B., Carlson,         Podell, D., English, Z., Lacey, K., Blattmann, A., Dockhorn,
+                  C., Carmichael, R., Chan, B., Chang, C., Chantzis, F.,                    ¨
+                  Chen, D., Chen, S., Chen, R., Chen, J., Chen, M., Chess,           T., Muller, J., Penna, J., and Rombach, R. Sdxl: Im-
+                  B., Cho, C., Chu, C., Chung, H. W., Cummings, D., Cur-              proving latent diffusion models for high-resolution image
+                  rier, J., Dai, Y., Decareaux, C., Degry, T., Deutsch, N.,           synthesis. arXiv preprint arXiv:2307.01952, 2023.
+                  Deville, D., Dhar, A., Dohan, D., Dowling, S., Dunning,          Qian, Y.-Y., Su, J., Hu, L., Zhang, P., Deng, Z., Zhao, P., and
+                  S., Ecoffet, A., Eleti, A., Eloundou, T., Farhi, D., Fedus,         Zhang, H. d3llm: Ultra-fast diffusion llm using pseudo-
+                  L., Felix, N., Fishman, S. P., Forte, J., Fulford, I., Gao, L.,     trajectory distillation. arXiv preprint arXiv:2601.07568,
+                  Georges, E., Gibson, C., Goel, V., Gogineni, T., Goh, G.,           2026.
+                  Gontijo-Lopes, R., Gordon, J., Grafstein, M., Gray, S.,          Qwen, :, Yang, A., Yang, B., Zhang, B., Hui, B., Zheng,
+                  Greene, R., Gross, J., Gu, S. S., Guo, Y., Hallacy, C., Han,        B., Yu, B., Li, C., Liu, D., Huang, F., Wei, H., Lin, H.,
+                  J., Harris, J., He, Y., Heaton, M., Heidecke, J., Hesse,           Yang, J., Tu, J., Zhang, J., Yang, J., Yang, J., Zhou, J.,
+                  C., Hickey, A., Hickey, W., Hoeschele, P., Houghton, B.,            Lin, J., Dang, K., Lu, K., Bao, K., Yang, K., Yu, L.,
+                  Hsu, K., Hu, S., Hu, X., Huizinga, J., Jain, S., Jain, S.,          Li, M., Xue, M., Zhang, P., Zhu, Q., Men, R., Lin, R.,
+                  Jang, J., Jiang, A., Jiang, R., Jin, H., Jin, D., Jomoto, S.,       Li, T., Tang, T., Xia, T., Ren, X., Ren, X., Fan, Y., Su,
+                  Jonn, B., Jun, H., Kaftan, T., Łukasz Kaiser, Kamali, A.,          Y., Zhang, Y., Wan, Y., Liu, Y., Cui, Z., Zhang, Z., and
+                  Kanitscheider, I., Keskar, N. S., Khan, T., Kilpatrick, L.,         Qiu, Z. Qwen2.5 technical report, 2025. URL https:
+                  Kim, J. W., Kim, C., Kim, Y., Kirchner, J. H., Kiros, J.,          //arxiv.org/abs/2412.15115.
+                  Knight, M., Kokotajlo, D., Łukasz Kondraciuk, Kondrich,
+                  A., Konstantinidis, A., Kosic, K., Krueger, G., Kuo, V.,         Rulli, M. E., Petruzzi, S., Michielon, E., Silvestri, F., Scar-
+                  Lampe,M.,Lan,I., Lee, T., Leike, J., Leung, J., Levy, D.,           dapane, S., and Devoto, A. Attention sinks in diffusion
+                  Li, C. M., Lim, R., Lin, M., Lin, S., Litwin, M., Lopez, T.,        language models, 2025. URL https://arxiv.org/
+                  Lowe, R., Lue, P., Makanju, A., Malfacini, K., Manning,             abs/2510.15731.
+                  S., Markov, T., Markovski, Y., Martin, B., Mayer, K.,
+                  Mayne,A.,McGrew,B.,McKinney,S.M.,McLeavey,C.,                    Sahoo, S. S., Arriola, M., Schiff, Y., Gokaslan, A., Marro-
+                  McMillan,P., McNeil, J., Medina, D., Mehta, A., Menick,             quin, E., Chiu, J. T., Rush, A., and Kuleshov, V. Simple
+                                                                               10
+                                             DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+                 and effective masked diffusion language models, 2024.       Yang, L., Tian, Y., Li, B., Zhang, X., Shen, K., Tong, Y., and
+                 URLhttps://arxiv.org/abs/2406.07524.                           Wang,M. Mmada: Multimodallarge diffusion language
+                                                                                models. arXiv preprint arXiv:2505.15809, 2025a.
+              Shi, J., Han, K., Wang, Z., Doucet, A., and Titsias, M. K.
+                 Simplified and generalized masked diffusion for discrete    Yang, Y., Wang, C., Wang, S., Wen, Z., Qi, B., Xu, H., and
+                 data, 2025. URLhttps://arxiv.org/abs/2406.                     Zhang, L. Diffusion llm with native variable generation
+                 04329.                                                         lengths: Let [eos] lead the way, 2025b. URL https:
+                                                                                //arxiv.org/abs/2510.24605.
+              Song, J. and Zhou, L. Ideas in inference-time scaling can      Ye, J., Xie, Z., Zheng, L., Gao, J., Wu, Z., Jiang, X., Li,
+                 benefit generative pre-training algorithms, 2025. URL          Z., and Kong, L. Dream 7b: Diffusion large language
+                 https://arxiv.org/abs/2503.07154.                              models. arXiv preprint arXiv:2508.15487, 2025.
+              Song, Y., Liu, X., Li, R., Liu, Z., Huang, Z., Guo, Q., He,    You, Z., Nie, S., Zhang, X., Hu, J., Zhou, J., Lu, Z., Wen,
+                 Z., and Qiu, X. Sparse-dllm: Accelerating diffusion            J.-R., and Li, C.   Llada-v: Large language diffusion
+                 llms with dynamic cache eviction, 2025a. URL https:            models with visual instruction tuning. arXiv preprint
+                 //arxiv.org/abs/2508.02558.                                    arXiv:2505.16933, 2025.
+              Song, Y., Zhang, Z., Luo, C., Gao, P., Xia, F., Luo, H., Li,   Zhang,J., Wei, J., Huang, H., Zhang, P., Zhu, J., and Chen, J.
+                 Z., Yang, Y., Yu, H., Qu, X., Fu, Y., Su, J., Zhang, G.,       Sageattention: Accurate 8-bit attention for plug-and-play
+                 Huang, W., Wang, M., Yan, L., Jia, X., Liu, J., Ma, W.-        inference acceleration. arXiv preprint arXiv:2410.02367,
+                 Y., Zhang, Y.-Q., Wu, Y., and Zhou, H. Seed diffusion:         2024.
+                 Alarge-scale diffusion language model with high-speed
+                 inference, 2025b. URL https://arxiv.org/abs/                Zhang, J., Xiang, C., Huang, H., Wei, J., Xi, H., Zhu,
+                 2508.02193.                                                    J., and Chen, J.   Spargeattn: Accurate sparse atten-
+                                                                                tion accelerating any model inference. arXiv preprint
+              Wei, L., Chen, W., Tang, P., Guo, X., Ye, L., Wang, R., and       arXiv:2502.18137, 2025a.
+                 Li, M. Orchestrating dual-boundaries: An arithmetic in-
+                 tensity inspired acceleration framework for diffusion lan-  Zhang, T., Li, Z., Yan, X., Qin, H., Guo, Y., and Zhang,
+                 guage models. arXiv preprint arXiv:2511.21759, 2025.           Y. Quant-dllm: Post-training extreme low-bit quantiza-
+                                                                                tion for diffusion large language models, 2025b. URL
+              Wu, C., Zhang, H., Xue, S., Diao, S., Fu, Y., Liu, Z.,            https://arxiv.org/abs/2510.03274.
+                 Molchanov, P., Luo, P., Han, S., and Xie, E.       Fast-    Zhu, F., Wang, R., Nie, S., Zhang, X., Wu, C., Hu,
+                 dllm v2: Efficient block-diffusion llm, 2025a.     URL         J., Zhou, J., Chen, J., Lin, Y., Wen, J.-R., and Li,
+                 https://arxiv.org/abs/2509.26328.                              C. Llada 1.5: Variance-reduced preference optimiza-
+              Wu,C.,Zhang,H.,Xue,S.,Liu,Z., Diao, S., Zhu, L., Luo,             tion for large language diffusion models, 2025. URL
+                 P., Han, S., and Xie, E. Fast-dllm: Training-free acceler-     https://arxiv.org/abs/2505.19223.
+                 ation of diffusion llm by enabling kv cache and parallel
+                 decoding, 2025b. URL https://arxiv.org/abs/
+                 2505.22618.
+              Xi, H., Yang, S., Zhao, Y., Xu, C., Li, M., Li, X., Lin, Y.,
+                 Cai, H., Zhang, J., Li, D., et al. Sparse videogen: Acceler-
+                 ating video diffusion transformers with spatial-temporal
+                 sparsity. arXiv preprint arXiv:2502.01776, 2025.
+              Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis,
+                 M. Efficient streaming language models with atten-
+                 tion sinks, 2024. URL https://arxiv.org/abs/
+                 2309.17453.
+              Xie, E., Chen, J., Chen, J., Cai, H., Tang, H., Lin, Y., Zhang,
+                 Z., Li, M., Zhu, L., Lu, Y., and Han, S.      Sana: Ef-
+                 ficient high-resolution image synthesis with linear dif-
+                 fusion transformers, 2024.    URL https://arxiv.
+                 org/abs/2410.10629.
+                                                                          11
+                                                DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+               A. Experiment Details
+               Weconductourexperimentsonseveral variants of two models: LLaDA-8B-Instruct (Nie et al., 2025), LLaDA-1.5 (Zhu
+               et al., 2025), Dream-v0-Base-7B (Ye et al., 2025), Dream-v0-Instruct-7B. Benchmarks include diverse datasets: GSM8K
+               (5-shot) (Cobbe et al., 2021), MATH (4-shot) (Hendrycks et al., 2021), HumanEval (0-shot) (Chen, 2021), and MBPP
+               (3-shot) (Austin et al., 2021), covering a range of reasoning and code generation tasks. Across all settings, we fix the block
+               size to 32 and generation length to 256 tokens except KLASS, which uses its best-performing block length.
+               All baselines are evaluated under their default hyperparameter settings. To identify the optimal hyperparameter configuration
+               for our method DAWN on different models, including τ          , τ        and τ     , we conduct a grid search on the HumanEval
+                                                                         edge  induced       sink
+               dataset. Specifically, we evaluate a range of candidate values for each parameter and plot the corresponding Accuracy–TPS
+               curves, visualized in Fig 7, 8, 9, 10.
+               Figure 7. We vary the threshold τ    , τ       , τ    andreportaccuracy(blue,left y-axis) and throughput TPS (red, right y-axis)
+                                                edge   induced  sink
+               onLLaDA-8B-Instruct. The dashed lines (yellow) mark the final settings τ      =0.07, τ         =0.70, τ     =0.01.
+                                                                                         edge         induced         sink
+               Figure 8. We vary the threshold τ    , τ       , τ    andreportaccuracy(blue,left y-axis) and throughput TPS (red, right y-axis)
+                                                edge   induced  sink
+               onLLaDA-1.5. Thedashedlines (yellow) mark the final settings τ        =0.07, τ        =0.70, τ     =0.01.
+                                                                                edge         induced         sink
+               Figure 9. We vary the threshold τ    , τ       , τ    andreportaccuracy(blue,left y-axis) and throughput TPS (red, right y-axis)
+                                                edge   induced  sink
+               onDream-v0-Base-7B.Thedashedlines(yellow) mark the final settings τ          =0.05, τ        =0.75, τ      =0.03.
+                                                                                        edge         induced         sink
+               In most cases, we observe a clear trade-off between throughput and accuracy: higher throughput is generally achieved at
+               the cost of reduced accuracy. To balance this trade-off, we select hyperparameter values that lie near the Pareto frontier,
+                                                                               12
+                                                 DAWN:Dependency-AwareFastInferenceforDiffusionLLMs
+               Figure 10. We vary the threshold τedge, τinduced, τsink and report accuracy (blue, left y-axis) and throughput TPS (red, right
+               y-axis) on Dream-v0-Instruct-7B. The dashed lines (yellow) mark the final settings τ     =0.10, τ         =0.75, τ     =0.03.
+                                                                                                    edge         induced         sink
+                favoring configurations that preserve high accuracy while providing meaningful efficiency gains. For example, on the
+                LLaDA-8B-Instruct model, we select τ            =0.07, which achieves the highest accuracy among the tested values while
+                                                           edge
+                offering higher throughput compared to τ         =0.08. This criterion ensures that the chosen configuration does not sacrifice
+                                                           edge
+                accuracy for marginal speed improvements.
+                For the the lower confidence threshold τ       hyperparameter, we perform a grid search over both models and benchmarks,
+                                                           low
+                resulting in 16 experimental settings in total. Within each setting, we further tune the method-specific hyperparameters to
+                obtain the best-performing configuration. The final selected results are reported in Table 3.
+               Table 3. Final hyperparameter settings for DAWN, where rows denote models and columns denote hyperparameter types. The
+                τ       , τ   , τ    are shared across benchmarks for each model, while τ     adopt benchmark-specific configurations.
+                 induced  sink   edge                                                     low
+                                                                                                           τ
+                                                         τ           τ        τ                              low
+                                                          induced     sink     edge
+                                      Model                                           GSM8K MATH HumanEval MBPP
+                              LLaDA-8B-Instruct            0.70      0.01     0.07       0.75       0.75           0.8          0.7
+                                   LLaDA-1.5               0.70      0.01     0.07       0.75       0.75           0.8         0.75
+                               Dream-v0-Base-7B            0.75      0.03     0.05       0.75        0.8           0.8          0.8
+                             Dream-v0-Instruct-7B          0.75      0.03     0.10       0.8         0.8           0.8          0.8
+                B. Discussion
+               This work is primarily motivated by the challenge of nonindependent position predictions in dLLMs, which suggests that
+                decoding order should account for dependencies among positions. In many existing analyses and methods, high confidence
+                is often treated as a sufficient indicator of per-position consistency or approximate independence, and the resulting update
+                rules largely rely on such conservative criteria, which can limit achievable parallelism and leave a substantial portion of
+                dLLMparallel potential underexploited. In contrast, this work attempts to capture positional coupling more directly and to
+                derive corresponding decoding strategies from these dependency relations.
+               Viewing dLLMdecodingthrough the lens of positional dependencies provides a complementary perspective that can more
+                directly address the persistent difficulty of parallel decoding under non-independence. It is hoped that this study will
+                encourage further investigation into dependency structures in dLLMs and inspire more efficient inference methods that
+                leverage them.
+                                                                                13
