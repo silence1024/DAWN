@@ -5,7 +5,7 @@ export HF_DATASETS_TRUST_REMOTE_CODE=true
 model_path='GSAI-ML/LLaDA-8B-Instruct'
 model_name='LLaDA-8B-Instruct'
 
-device=0
+device=0,1,2
 
 ############################################### gsm8k evaluations ###############################################
 task=gsm8k
