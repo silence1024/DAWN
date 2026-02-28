@@ -31,7 +31,6 @@ from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
-from lm_eval.utils import simple_parse_args_string
 from tqdm import tqdm
 import os
 from transformers import AutoTokenizer, AutoModel, AutoConfig
@@ -50,14 +49,6 @@ def set_seed(seed):
 
 @register_model("llada_dist")
 class LLaDAEvalHarness(LM):
-    @classmethod
-    def create_from_arg_string(cls, arg_string, additional_config=None):
-        args = simple_parse_args_string(arg_string)
-        config = {} if additional_config is None else dict(additional_config)
-        # Prefer explicit model_args values when the same key is also passed by lm-eval defaults.
-        config.update(args)
-        return cls(**config)
-
     def __init__(
         self,
         model_path='',
@@ -146,10 +137,6 @@ class LLaDAEvalHarness(LM):
         self.steps = steps
         self.gen_length = gen_length
         self.block_length = block_length
-        if self.max_length <= self.gen_length:
-            raise ValueError(
-                f"max_length ({self.max_length}) must be greater than gen_length ({self.gen_length})"
-            )
         self.remasking = remasking
         self.use_cache = use_cache
         self.threshold = threshold
@@ -345,7 +332,7 @@ class LLaDAEvalHarness(LM):
         for batch in tqdm(batched_requests, desc="Generating..."):
             batched_input_ids = []
             max_len = 0
-            max_prompt_len = self.max_length - self.gen_length
+            pad_len = []
             for req in batch:
                 question = req.args[0]
                 if self.is_instruct:
@@ -355,21 +342,16 @@ class LLaDAEvalHarness(LM):
                 else:
                     user_input = question
                     input_ids = self.tokenizer(user_input)['input_ids']
-
-                # Prevent OOM: cap prompt length so total length stays within max_length.
-                if len(input_ids) > max_prompt_len:
-                    input_ids = input_ids[-max_prompt_len:]
-
                 batched_input_ids.append(input_ids)
                 max_len = max(max_len, len(input_ids))
-            pad_len = [max_len - len(input_ids) for input_ids in batched_input_ids]
+                pad_len.append(max_len - len(input_ids))
             
             # pad batched_input_ids to the same length
             batched_input_ids = [torch.cat([torch.full((1, max_len - len(input_ids)), self.tokenizer.pad_token_id, dtype=torch.long, device=self.device), torch.tensor(input_ids, dtype=torch.long, device=self.device).unsqueeze(0)], dim=1) for input_ids in batched_input_ids]
             batched_input_ids = torch.cat(batched_input_ids, dim=0)
             batched_input_ids = batched_input_ids.to(self.device)
             
-            if batched_input_ids.shape[0] == 1:
+            if self.batch_size == 1:
                 attention_mask = None
             else:
                 attention_mask = torch.zeros((batched_input_ids.shape[0], 1, max_len+self.gen_length, max_len+self.gen_length), device=self.device, dtype=torch.bool)
