@@ -19,7 +19,7 @@ launch_cmd="accelerate launch --num_processes ${num_processes}"
 task=gsm8k
 length=256
 block_length=32
-num_fewshot=5
+num_fewshot=1
 steps=$((length / block_length))
 
 # baseline
