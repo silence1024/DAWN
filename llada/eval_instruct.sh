@@ -15,28 +15,28 @@ num_fewshot=5
 steps=$((length / block_length))
 
 # baseline
-CUDA_VISIBLE_DEVICES=${device} accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
---confirm_run_unsafe_code --model llada_dist \
---model_args model_path=${model_path},gen_length=${length},steps=${length},block_length=${block_length},show_speed=True,outp_path=evals_results_${model_name}/baseline/${task}-ns0-${length}/results.jsonl \
---output_path evals_results_${model_name}/baseline/${task}-ns0-${length}
+# CUDA_VISIBLE_DEVICES=${device} accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
+# --confirm_run_unsafe_code --model llada_dist \
+# --model_args model_path=${model_path},gen_length=${length},steps=${length},block_length=${block_length},show_speed=True,outp_path=evals_results_${model_name}/baseline/${task}-ns0-${length}/results.jsonl \
+# --output_path evals_results_${model_name}/baseline/${task}-ns0-${length}
 
-# parallel threshold
-CUDA_VISIBLE_DEVICES=${device} accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
---confirm_run_unsafe_code --model llada_dist \
---model_args model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},show_speed=True,threshold=0.9,outp_path=evals_results_${model_name}/parallel/${task}-ns0-${length}/results.jsonl \
---output_path evals_results_${model_name}/parallel/${task}-ns0-${length}
+# # parallel threshold
+# CUDA_VISIBLE_DEVICES=${device} accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
+# --confirm_run_unsafe_code --model llada_dist \
+# --model_args model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},show_speed=True,threshold=0.9,outp_path=evals_results_${model_name}/parallel/${task}-ns0-${length}/results.jsonl \
+# --output_path evals_results_${model_name}/parallel/${task}-ns0-${length}
 
-# klass
-CUDA_VISIBLE_DEVICES=${device} accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
---confirm_run_unsafe_code --model llada_dist \
---model_args model_path=${model_path},gen_length=${length},steps=${length},block_length=64,show_speed=True,klass=True,threshold_klass=0.6,kl_threshold=0.015,outp_path=evals_results_${model_name}/klass/${task}-ns0-${length}/results.jsonl \
---output_path evals_results_${model_name}/klass/${task}-ns0-${length}
+# # klass
+# CUDA_VISIBLE_DEVICES=${device} accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
+# --confirm_run_unsafe_code --model llada_dist \
+# --model_args model_path=${model_path},gen_length=${length},steps=${length},block_length=64,show_speed=True,klass=True,threshold_klass=0.6,kl_threshold=0.015,outp_path=evals_results_${model_name}/klass/${task}-ns0-${length}/results.jsonl \
+# --output_path evals_results_${model_name}/klass/${task}-ns0-${length}
 
-# local leap
-CUDA_VISIBLE_DEVICES=${device} accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
---confirm_run_unsafe_code --model llada_dist \
---model_args model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},show_speed=True,local_leap=True,threshold=0.9,relaxed_threshold=0.75,radius=4,outp_path=evals_results_${model_name}/local_leap/${task}-ns0-${length}/results.jsonl \
---output_path evals_results_${model_name}/local_leap/${task}-ns0-${length}
+# # local leap
+# CUDA_VISIBLE_DEVICES=${device} accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
+# --confirm_run_unsafe_code --model llada_dist \
+# --model_args model_path=${model_path},gen_length=${length},steps=${steps},block_length=${block_length},show_speed=True,local_leap=True,threshold=0.9,relaxed_threshold=0.75,radius=4,outp_path=evals_results_${model_name}/local_leap/${task}-ns0-${length}/results.jsonl \
+# --output_path evals_results_${model_name}/local_leap/${task}-ns0-${length}
 
 # dawn
 CUDA_VISIBLE_DEVICES=${device} accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
