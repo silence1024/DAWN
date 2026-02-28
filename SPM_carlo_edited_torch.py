@@ -26,6 +26,45 @@ def _as_square_dense_tensor(
     return adj
 
 
+def _degenerate_block_bounds(eigenvalues: torch.Tensor, tol: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Find contiguous degenerate-eigenvalue blocks from sorted eigenvalues.
+
+    For eigh output (ascending), a new block starts where adjacent gap >= tol.
+    Returns:
+        starts: 1D long tensor of block starts (inclusive)
+        ends:   1D long tensor of block ends   (exclusive)
+    """
+    n = eigenvalues.numel()
+    device = eigenvalues.device
+    if n == 0:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty
+
+    if n == 1:
+        starts = torch.zeros(1, dtype=torch.long, device=device)
+        ends = torch.ones(1, dtype=torch.long, device=device)
+        return starts, ends
+
+    gaps = (eigenvalues[1:] - eigenvalues[:-1]).abs()
+    new_block = gaps >= tol
+    starts = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.long, device=device),
+            torch.nonzero(new_block, as_tuple=False).squeeze(1) + 1,
+        ],
+        dim=0,
+    )
+    ends = torch.cat(
+        [
+            starts[1:],
+            torch.tensor([n], dtype=torch.long, device=device),
+        ],
+        dim=0,
+    )
+    return starts, ends
+
+
 @torch.no_grad()
 def perturbation_torch(
     adj_unperturbed: torch.Tensor,
@@ -42,26 +81,23 @@ def perturbation_torch(
 
     v2 = eigenvectors.clone()
     adj_pertu = adj_full - adj_unperturbed
-    degen_done = torch.zeros(n, dtype=torch.bool, device=adj_full.device)
 
-    for l in range(n):
-        if degen_done[l]:
-            continue
+    starts, ends = _degenerate_block_bounds(eigenvalues, tol=tol)
+    block_sizes = ends - starts
+    multi_blocks = block_sizes > 1
 
-        idx = torch.nonzero((eigenvalues - eigenvalues[l]).abs() < tol, as_tuple=False).squeeze(1)
-        if idx.numel() > 1:
-            v_redundant = eigenvectors[:, idx]
-            m = v_redundant.T @ adj_pertu @ v_redundant
-            m = (m + m.T) * 0.5
+    # Each degenerate eigenspace needs its own small eigendecomposition.
+    # This is already matrix-form inside each block; only block iteration remains.
+    for start, end in zip(starts[multi_blocks].tolist(), ends[multi_blocks].tolist()):
+        idx = torch.arange(start, end, device=adj_full.device)
+        v_redundant = eigenvectors[:, idx]
+        m = v_redundant.T @ adj_pertu @ v_redundant
+        m = (m + m.T) * 0.5
 
-            _, v_r = torch.linalg.eigh(m)
-            v_redundant = v_redundant @ v_r
-            v_redundant = v_redundant / torch.linalg.norm(v_redundant, dim=0, keepdim=True).clamp_min(1e-30)
-
-            v2[:, idx] = v_redundant
-            degen_done[idx] = True
-        else:
-            degen_done[l] = True
+        _, v_r = torch.linalg.eigh(m)
+        v_redundant = v_redundant @ v_r
+        v_redundant = v_redundant / torch.linalg.norm(v_redundant, dim=0, keepdim=True).clamp_min(1e-30)
+        v2[:, idx] = v_redundant
 
     diag_vals = torch.diagonal(v2.T @ adj_full @ v2)
     adj_anneal = (v2 * diag_vals.unsqueeze(0)) @ v2.T
